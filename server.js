@@ -7,13 +7,29 @@ const express = require('express');
 const { Rcon } = require('rcon-client');
 const cors = require('cors');
 const { createServer } = require('http');
-const { Server } = require('socket.io');
+const WebSocket = require('ws'); // Added for raw WebSocket
 const { Pool } = require('pg');
 
 const app = express();
 const httpServer = createServer(app);
-const io = new Server(httpServer, {
-    cors: { origin: '*' }
+
+// Set up WebSocket server on /ws
+const wss = new WebSocket.Server({ server: httpServer, path: '/ws' });
+
+wss.on('connection', (ws) => {
+    console.log('WebSocket client connected');
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            if (data.type === 'subscribe') {
+                // In a real implementation, you'd open a persistent RCON connection and relay output
+                ws.send(JSON.stringify({ type: 'subscribed', server: data.ip }));
+            }
+        } catch (e) {
+            console.error('Invalid WebSocket message', e);
+        }
+    });
+    ws.on('close', () => console.log('WebSocket client disconnected'));
 });
 
 app.use(cors());
@@ -257,16 +273,6 @@ app.post('/api/gportal/resolve', (req, res) => {
     } else {
         res.status(404).json({ error: 'Code not found' });
     }
-});
-
-// ---------- WebSocket for Real‑Time Updates ----------
-io.on('connection', (socket) => {
-    console.log('Client connected', socket.id);
-    socket.on('subscribe', ({ ip, port, password }) => {
-        // In a full implementation, we'd open a persistent RCON connection and relay server output
-        socket.emit('subscribed', { ip, port });
-    });
-    socket.on('disconnect', () => console.log('Client disconnected', socket.id));
 });
 
 const PORT = process.env.PORT || 3000;
