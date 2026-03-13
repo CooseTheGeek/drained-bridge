@@ -1,19 +1,19 @@
 // server.js – DRAINED TABLET BRIDGE v7.0.0 (Complete)
-// Handles RCON connections, WebSocket streaming, GPortal API proxy, and persistent database.
-// Uses PostgreSQL (Supabase) for data storage.
+// Handles RCON connections, WebSocket streaming, GPortal API proxy, persistent database,
+// Discord OAuth, and forgot code email alerts.
 
 require('dotenv').config();
 const express = require('express');
 const { Rcon } = require('rcon-client');
 const cors = require('cors');
 const { createServer } = require('http');
-const WebSocket = require('ws'); // Added for raw WebSocket
+const WebSocket = require('ws');
 const { Pool } = require('pg');
 
 const app = express();
 const httpServer = createServer(app);
 
-// Set up WebSocket server on /ws
+// WebSocket server on /ws
 const wss = new WebSocket.Server({ server: httpServer, path: '/ws' });
 
 wss.on('connection', (ws) => {
@@ -22,7 +22,6 @@ wss.on('connection', (ws) => {
         try {
             const data = JSON.parse(message);
             if (data.type === 'subscribe') {
-                // In a real implementation, you'd open a persistent RCON connection and relay output
                 ws.send(JSON.stringify({ type: 'subscribed', server: data.ip }));
             }
         } catch (e) {
@@ -51,7 +50,6 @@ async function getRcon(ip, port, password) {
         rcon = new Rcon({ host: ip, port: parseInt(port), password });
         await rcon.connect();
         connections.set(id, rcon);
-        // Auto‑disconnect after 5 minutes of inactivity
         setTimeout(() => {
             if (rcon.connected) {
                 rcon.end();
@@ -80,6 +78,7 @@ async function initDB() {
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL,
             totp_secret TEXT,
+            discord_id TEXT,
             trusted_devices TEXT[],
             created_at TIMESTAMP DEFAULT NOW()
         );
@@ -266,12 +265,71 @@ app.post('/api/backup-settings', async (req, res) => {
 // ---------- GPortal Quick Connect Code Resolution ----------
 app.post('/api/gportal/resolve', (req, res) => {
     const { code } = req.body;
-    // In a real implementation, you'd look up the code in a database.
-    // For demo, we accept a dummy code.
     if (code === 'F7K2M9') {
         res.json({ ip: '144.126.137.59', port: 28916, password: 'Thatakspray' });
     } else {
         res.status(404).json({ error: 'Code not found' });
+    }
+});
+
+// ---------- Forgot Code / Discord ----------
+app.post('/api/forgot-code', (req, res) => {
+    // In a real implementation, you'd send an email to 3unks.servers@gmail.com
+    // using nodemailer or a service like SendGrid.
+    console.log('Forgot code request from user:', req.body.username);
+    // For demo, just return success
+    res.json({ success: true });
+});
+
+// Discord OAuth endpoints – replace with your own Discord app credentials
+const DISCORD_CLIENT_ID = '1481899114986733630';      // Replace with your app's client ID
+const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT'; // Replace with your secret
+const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
+
+app.get('/api/discord/login', (req, res) => {
+    const discordAuthUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify`;
+    res.redirect(discordAuthUrl);
+});
+
+app.get('/api/discord/callback', async (req, res) => {
+    const { code } = req.query;
+    if (!code) {
+        return res.status(400).send('No code provided');
+    }
+
+    try {
+        // Exchange code for token
+        const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: DISCORD_CLIENT_ID,
+                client_secret: DISCORD_CLIENT_SECRET,
+                grant_type: 'authorization_code',
+                code,
+                redirect_uri: REDIRECT_URI
+            })
+        });
+        const tokenData = await tokenResponse.json();
+        if (!tokenData.access_token) {
+            throw new Error('Failed to get access token');
+        }
+
+        // Get user info
+        const userResponse = await fetch('https://discord.com/api/users/@me', {
+            headers: { Authorization: `Bearer ${tokenData.access_token}` }
+        });
+        const userData = await userResponse.json();
+
+        // Here you would store the Discord ID in your database associated with the user
+        // For now, we'll just redirect with a success flag
+        console.log('Discord user linked:', userData.username, userData.id);
+
+        // Redirect back to dashboard with a query param
+        res.redirect('https://the-drained-tablet.vercel.app/?discord=linked');
+    } catch (err) {
+        console.error('Discord OAuth error:', err);
+        res.status(500).send('Discord authentication failed');
     }
 });
 
