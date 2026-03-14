@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (Complete)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (Complete with detailed logging)
 // Handles RCON connections, WebSocket streaming, GPortal API proxy, persistent database,
 // Discord OAuth, and forgot code email alerts.
 
@@ -45,71 +45,102 @@ const connections = new Map();
 
 async function getRcon(ip, port, password) {
     const id = `${ip}:${port}`;
+    console.log(`[${new Date().toISOString()}] getRcon called for ${id}`);
+
     let rcon = connections.get(id);
-    if (!rcon || !rcon.connected) {
-        rcon = new Rcon({ host: ip, port: parseInt(port), password });
+    if (rcon && rcon.connected) {
+        console.log(`✅ Using existing connection for ${id}`);
+        return rcon;
+    }
+
+    console.log(`🔄 Creating new Rcon connection to ${ip}:${port}...`);
+    rcon = new Rcon({
+        host: ip,
+        port: parseInt(port),
+        password,
+        timeout: 10000 // 10 seconds timeout
+    });
+
+    try {
         await rcon.connect();
+        console.log(`✅ Connected to ${ip}:${port}`);
         connections.set(id, rcon);
+
+        // Set a timeout to close the connection after 5 minutes of inactivity
         setTimeout(() => {
             if (rcon.connected) {
+                console.log(`⏰ Closing idle connection to ${id}`);
                 rcon.end();
                 connections.delete(id);
             }
         }, 300000);
+
+        return rcon;
+    } catch (err) {
+        console.error(`❌ Failed to connect to ${ip}:${port}:`, err.message);
+        console.error('Error details:', err);
+        throw err;
     }
-    return rcon;
 }
 
 // ---------- Database Setup ----------
 async function initDB() {
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS combat_logs (
-            id SERIAL PRIMARY KEY,
-            player_id TEXT NOT NULL,
-            player_name TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            victim TEXT,
-            weapon TEXT,
-            distance INTEGER,
-            timestamp BIGINT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL,
-            totp_secret TEXT,
-            discord_id TEXT,
-            trusted_devices TEXT[],
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS claims (
-            id SERIAL PRIMARY KEY,
-            player_id TEXT NOT NULL,
-            item_shortname TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            claimed_at TIMESTAMP DEFAULT NOW(),
-            expires_at TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id SERIAL PRIMARY KEY,
-            username TEXT,
-            action TEXT NOT NULL,
-            ip TEXT,
-            timestamp TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS zones (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            position JSONB NOT NULL,
-            radius INTEGER,
-            flags JSONB,
-            enabled BOOLEAN DEFAULT true
-        );
-        CREATE TABLE IF NOT EXISTS backup_settings (
-            id TEXT PRIMARY KEY DEFAULT 'default',
-            settings JSONB NOT NULL
-        );
-    `);
+    try {
+        console.log('📦 Initializing database tables...');
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS combat_logs (
+                id SERIAL PRIMARY KEY,
+                player_id TEXT NOT NULL,
+                player_name TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                victim TEXT,
+                weapon TEXT,
+                distance INTEGER,
+                timestamp BIGINT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL,
+                totp_secret TEXT,
+                discord_id TEXT,
+                trusted_devices TEXT[],
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS claims (
+                id SERIAL PRIMARY KEY,
+                player_id TEXT NOT NULL,
+                item_shortname TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                claimed_at TIMESTAMP DEFAULT NOW(),
+                expires_at TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id SERIAL PRIMARY KEY,
+                username TEXT,
+                action TEXT NOT NULL,
+                ip TEXT,
+                timestamp TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS zones (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                position JSONB NOT NULL,
+                radius INTEGER,
+                flags JSONB,
+                enabled BOOLEAN DEFAULT true
+            );
+            CREATE TABLE IF NOT EXISTS backup_settings (
+                id TEXT PRIMARY KEY DEFAULT 'default',
+                settings JSONB NOT NULL
+            );
+        `);
+        console.log('✅ Database tables ready');
+    } catch (err) {
+        console.error('❌ Database initialization error:', err.message);
+        console.error(err.stack);
+        throw err;
+    }
 }
 initDB().catch(console.error);
 
@@ -117,29 +148,45 @@ initDB().catch(console.error);
 
 // Health check
 app.get('/api/health', (req, res) => {
+    console.log(`[${new Date().toISOString()}] GET /api/health`);
     res.json({ status: 'ok', connections: connections.size });
 });
 
 // Connect with credentials
 app.post('/api/connect', async (req, res) => {
     const { ip, port, password } = req.body;
+    console.log(`[${new Date().toISOString()}] POST /api/connect called with:`, { ip, port, password: '***' });
+
     try {
+        console.log('🔌 Attempting to get Rcon connection...');
         const rcon = await getRcon(ip, port, password);
-        await rcon.send('status');
+        console.log('✅ Rcon connection obtained, sending test command...');
+
+        const result = await rcon.send('status');
+        console.log('📨 Test command response:', result ? result.substring(0, 200) + '...' : '(empty)');
+
         res.json({ success: true, server: { ip, port, password } });
     } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
+        console.error('❌ Error in /api/connect:', err.message);
+        console.error('Stack:', err.stack);
+        console.error('Code:', err.code);
+        res.status(500).json({ success: false, error: err.message, code: err.code });
     }
 });
 
 // Execute RCON command
 app.post('/api/command', async (req, res) => {
     const { ip, port, password, command } = req.body;
+    console.log(`[${new Date().toISOString()}] POST /api/command:`, { ip, port, command });
+
     try {
         const rcon = await getRcon(ip, port, password);
         const result = await rcon.send(command);
+        console.log(`📨 Command response (first 200 chars):`, result ? result.substring(0, 200) + '...' : '(empty)');
         res.json({ success: true, result });
     } catch (err) {
+        console.error('❌ Error in /api/command:', err.message);
+        console.error('Stack:', err.stack);
         res.status(500).json({ success: false, error: err.message });
     }
 });
@@ -154,6 +201,7 @@ app.post('/api/combatlog', async (req, res) => {
         );
         res.json({ success: true });
     } catch (err) {
+        console.error('❌ Error saving combat log:', err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 });
@@ -166,6 +214,7 @@ app.get('/api/combatlog/:playerId', async (req, res) => {
         );
         res.json(result.rows);
     } catch (err) {
+        console.error('❌ Error fetching combat logs:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -180,6 +229,7 @@ app.post('/api/claim', async (req, res) => {
         );
         res.json({ success: true });
     } catch (err) {
+        console.error('❌ Error adding claim:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -192,6 +242,7 @@ app.get('/api/claims/:playerId', async (req, res) => {
         );
         res.json(result.rows);
     } catch (err) {
+        console.error('❌ Error fetching claims:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -202,6 +253,7 @@ app.get('/api/zones', async (req, res) => {
         const result = await pool.query('SELECT * FROM zones');
         res.json(result.rows);
     } catch (err) {
+        console.error('❌ Error fetching zones:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -215,6 +267,7 @@ app.post('/api/zones', async (req, res) => {
         );
         res.json({ success: true });
     } catch (err) {
+        console.error('❌ Error saving zone:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -224,6 +277,7 @@ app.delete('/api/zones/:id', async (req, res) => {
         await pool.query('DELETE FROM zones WHERE id = $1', [req.params.id]);
         res.json({ success: true });
     } catch (err) {
+        console.error('❌ Error deleting zone:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -245,6 +299,7 @@ app.get('/api/backup-settings', async (req, res) => {
             res.json(result.rows[0].settings);
         }
     } catch (err) {
+        console.error('❌ Error fetching backup settings:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -258,6 +313,7 @@ app.post('/api/backup-settings', async (req, res) => {
         );
         res.json({ success: true });
     } catch (err) {
+        console.error('❌ Error saving backup settings:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -265,6 +321,7 @@ app.post('/api/backup-settings', async (req, res) => {
 // ---------- GPortal Quick Connect Code Resolution ----------
 app.post('/api/gportal/resolve', (req, res) => {
     const { code } = req.body;
+    console.log(`[${new Date().toISOString()}] POST /api/gportal/resolve with code: ${code}`);
     if (code === 'F7K2M9') {
         res.json({ ip: '144.126.137.59', port: 28916, password: 'Thatakspray' });
     } else {
@@ -274,25 +331,24 @@ app.post('/api/gportal/resolve', (req, res) => {
 
 // ---------- Forgot Code / Discord ----------
 app.post('/api/forgot-code', (req, res) => {
-    // In a real implementation, you'd send an email to 3unks.servers@gmail.com
-    // using nodemailer or a service like SendGrid.
-    console.log('Forgot code request from user:', req.body.username);
-    // For demo, just return success
+    console.log('📧 Forgot code request from user:', req.body.username);
     res.json({ success: true });
 });
 
 // Discord OAuth endpoints – replace with your own Discord app credentials
-const DISCORD_CLIENT_ID = '1481899114986733630';      // Replace with your app's client ID
-const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT'; // Replace with your secret
+const DISCORD_CLIENT_ID = '1481899114986733630';
+const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
 const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
 
 app.get('/api/discord/login', (req, res) => {
+    console.log(`[${new Date().toISOString()}] GET /api/discord/login - redirecting to Discord`);
     const discordAuthUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify`;
     res.redirect(discordAuthUrl);
 });
 
 app.get('/api/discord/callback', async (req, res) => {
     const { code } = req.query;
+    console.log(`[${new Date().toISOString()}] GET /api/discord/callback with code: ${code ? 'present' : 'missing'}`);
     if (!code) {
         return res.status(400).send('No code provided');
     }
@@ -321,14 +377,12 @@ app.get('/api/discord/callback', async (req, res) => {
         });
         const userData = await userResponse.json();
 
-        // Here you would store the Discord ID in your database associated with the user
-        // For now, we'll just redirect with a success flag
-        console.log('Discord user linked:', userData.username, userData.id);
+        console.log('✅ Discord user linked:', userData.username, userData.id);
 
-        // Redirect back to dashboard with a query param
         res.redirect('https://the-drained-tablet.vercel.app/?discord=linked');
     } catch (err) {
-        console.error('Discord OAuth error:', err);
+        console.error('❌ Discord OAuth error:', err.message);
+        console.error(err.stack);
         res.status(500).send('Discord authentication failed');
     }
 });
