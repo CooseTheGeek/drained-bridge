@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (WebRcon with password in URL)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (WebRcon with correct auth handshake)
 // Handles WebRcon connections over WebSockets, persistent database, Discord OAuth, etc.
 
 require('dotenv').config();
@@ -110,7 +110,6 @@ const connections = new Map(); // key: "ip:port", value: { ws, sendCommand, clos
  * @returns {Promise<{send: (cmd: string) => Promise<string>, close: () => void}>}
  */
 async function createWebRconConnection(ip, port, password) {
-    // Include password in the WebSocket URL (common for WebRcon)
     const url = `ws://${ip}:${port}/${password}`;
     console.log(`🔄 Creating WebRcon connection to ${url}`);
 
@@ -120,21 +119,45 @@ async function createWebRconConnection(ip, port, password) {
             rejectUnauthorized: false
         });
 
+        let authenticated = false;
         const pendingCommands = new Map(); // id -> { resolve, reject, timeout }
+        let authTimeout = setTimeout(() => {
+            if (!authenticated) {
+                ws.close();
+                reject(new Error('Authentication timeout: server did not respond to auth request'));
+            }
+        }, 5000);
 
         ws.on('open', () => {
-            console.log('✅ WebSocket opened, connection ready');
-            // Assume password in URL is sufficient – no separate auth message needed.
-            resolve({
-                send: (command) => sendCommand(ws, command, pendingCommands),
-                close: () => ws.close()
-            });
+            console.log('✅ WebSocket opened, sending authentication message...');
+            // Send WebRcon authentication message
+            ws.send(JSON.stringify({
+                Identifier: -1,
+                Message: password,
+                Name: "WebRcon"
+            }));
         });
 
         ws.on('message', (data) => {
             try {
                 const response = JSON.parse(data.toString());
                 console.log('📩 WebRcon message:', response);
+
+                // Handle authentication response
+                if (response.Identifier === -1) {
+                    clearTimeout(authTimeout);
+                    if (response.Message === "Success") {
+                        authenticated = true;
+                        console.log('✅ WebRcon authenticated');
+                        resolve({
+                            send: (command) => sendCommand(ws, command, pendingCommands),
+                            close: () => ws.close()
+                        });
+                    } else {
+                        reject(new Error('Authentication failed: ' + response.Message));
+                    }
+                    return;
+                }
 
                 // Handle command response
                 const pending = pendingCommands.get(response.Identifier);
@@ -150,24 +173,20 @@ async function createWebRconConnection(ip, port, password) {
 
         ws.on('error', (err) => {
             console.error('❌ WebSocket error:', err.message);
+            clearTimeout(authTimeout);
             reject(err);
         });
 
         ws.on('close', () => {
             console.log('🔌 WebRcon connection closed');
+            clearTimeout(authTimeout);
             // Reject any pending commands
             for (const [id, pending] of pendingCommands) {
                 clearTimeout(pending.timeout);
                 pending.reject(new Error('Connection closed'));
             }
             pendingCommands.clear();
-            // Remove from connections map
-            for (const [key, conn] of connections.entries()) {
-                if (conn.ws === ws) {
-                    connections.delete(key);
-                    break;
-                }
-            }
+            // Remove from connections map (handled by getWebRcon)
         });
     });
 }
@@ -199,7 +218,7 @@ function sendCommand(ws, command, pendingMap) {
 async function getWebRcon(ip, port, password) {
     const key = `${ip}:${port}`;
     let entry = connections.get(key);
-    if (entry && entry.ws.readyState === WebSocket.OPEN) {
+    if (entry && entry.ws && entry.ws.readyState === WebSocket.OPEN) {
         console.log(`✅ Reusing existing WebRcon connection for ${key}`);
         return entry;
     }
@@ -211,9 +230,15 @@ async function getWebRcon(ip, port, password) {
     }
 
     console.log(`🔄 Creating new WebRcon connection for ${key}`);
-    const connection = await createWebRconConnection(ip, port, password);
-    connections.set(key, connection);
-    return connection;
+    try {
+        const connection = await createWebRconConnection(ip, port, password);
+        connections.set(key, connection);
+        return connection;
+    } catch (err) {
+        // Ensure the entry is removed on failure
+        connections.delete(key);
+        throw err;
+    }
 }
 
 // ---------- API Endpoints ----------
