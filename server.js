@@ -1,10 +1,8 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (Complete with detailed logging)
-// Handles RCON connections, WebSocket streaming, GPortal API proxy, persistent database,
-// Discord OAuth, and forgot code email alerts.
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (WebRcon for Rust CE)
+// Handles WebRcon connections over WebSockets, persistent database, Discord OAuth, etc.
 
 require('dotenv').config();
 const express = require('express');
-const { Rcon } = require('rcon-client');
 const cors = require('cors');
 const { createServer } = require('http');
 const WebSocket = require('ws');
@@ -13,11 +11,11 @@ const { Pool } = require('pg');
 const app = express();
 const httpServer = createServer(app);
 
-// WebSocket server on /ws
+// WebSocket server for dashboard real‑time features (separate from WebRcon)
 const wss = new WebSocket.Server({ server: httpServer, path: '/ws' });
 
 wss.on('connection', (ws) => {
-    console.log('WebSocket client connected');
+    console.log('📡 Dashboard WebSocket client connected');
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
@@ -28,7 +26,7 @@ wss.on('connection', (ws) => {
             console.error('Invalid WebSocket message', e);
         }
     });
-    ws.on('close', () => console.log('WebSocket client disconnected'));
+    ws.on('close', () => console.log('📡 Dashboard WebSocket client disconnected'));
 });
 
 app.use(cors());
@@ -40,50 +38,7 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// In‑memory RCON connection cache with expiry
-const connections = new Map();
-
-async function getRcon(ip, port, password) {
-    const id = `${ip}:${port}`;
-    console.log(`[${new Date().toISOString()}] getRcon called for ${id}`);
-
-    let rcon = connections.get(id);
-    if (rcon && rcon.connected) {
-        console.log(`✅ Using existing connection for ${id}`);
-        return rcon;
-    }
-
-    console.log(`🔄 Creating new Rcon connection to ${ip}:${port}...`);
-    rcon = new Rcon({
-        host: ip,
-        port: parseInt(port),
-        password,
-        timeout: 10000 // 10 seconds timeout
-    });
-
-    try {
-        await rcon.connect();
-        console.log(`✅ Connected to ${ip}:${port}`);
-        connections.set(id, rcon);
-
-        // Set a timeout to close the connection after 5 minutes of inactivity
-        setTimeout(() => {
-            if (rcon.connected) {
-                console.log(`⏰ Closing idle connection to ${id}`);
-                rcon.end();
-                connections.delete(id);
-            }
-        }, 300000);
-
-        return rcon;
-    } catch (err) {
-        console.error(`❌ Failed to connect to ${ip}:${port}:`, err.message);
-        console.error('Error details:', err);
-        throw err;
-    }
-}
-
-// ---------- Database Setup ----------
+// ---------- Database Setup (unchanged) ----------
 async function initDB() {
     try {
         console.log('📦 Initializing database tables...');
@@ -144,6 +99,139 @@ async function initDB() {
 }
 initDB().catch(console.error);
 
+// ---------- WebRcon Connection Management ----------
+const connections = new Map(); // key: "ip:port", value: { ws, sendCommand, close }
+
+/**
+ * Creates a WebRcon connection to a Rust server.
+ * @param {string} ip   Server IP
+ * @param {number} port RCON port (usually 28916)
+ * @param {string} password RCON password
+ * @returns {Promise<{send: (cmd: string) => Promise<string>, close: () => void}>}
+ */
+async function createWebRconConnection(ip, port, password) {
+    const url = `ws://${ip}:${port}`;
+    console.log(`🔄 Creating WebRcon connection to ${url}`);
+
+    return new Promise((resolve, reject) => {
+        const ws = new WebSocket(url, {
+            handshakeTimeout: 10000,
+            rejectUnauthorized: false
+        });
+
+        let isAuthenticated = false;
+        const pendingCommands = new Map(); // id -> { resolve, reject, timeout }
+
+        ws.on('open', () => {
+            console.log('✅ WebSocket opened, sending authentication...');
+            // Send authentication message (WebRcon expects JSON with Identifier -1)
+            ws.send(JSON.stringify({
+                Identifier: -1,
+                Message: password,
+                Name: "WebRcon"
+            }));
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const response = JSON.parse(data.toString());
+                console.log('📩 WebRcon message:', response);
+
+                if (response.Identifier === -1) {
+                    if (response.Message === "Success") {
+                        isAuthenticated = true;
+                        console.log('✅ WebRcon authenticated');
+                        // Resolve the promise with the API object
+                        resolve({
+                            send: (command) => sendCommand(ws, command, pendingCommands),
+                            close: () => ws.close()
+                        });
+                    } else {
+                        reject(new Error('Authentication failed: ' + response.Message));
+                    }
+                    return;
+                }
+
+                // Handle command response
+                const pending = pendingCommands.get(response.Identifier);
+                if (pending) {
+                    clearTimeout(pending.timeout);
+                    pending.resolve(response.Message);
+                    pendingCommands.delete(response.Identifier);
+                }
+            } catch (e) {
+                console.error('❌ Failed to parse WebRcon message:', e);
+            }
+        });
+
+        ws.on('error', (err) => {
+            console.error('❌ WebSocket error:', err.message);
+            reject(err);
+        });
+
+        ws.on('close', () => {
+            console.log('🔌 WebRcon connection closed');
+            // Reject any pending commands
+            for (const [id, pending] of pendingCommands) {
+                clearTimeout(pending.timeout);
+                pending.reject(new Error('Connection closed'));
+            }
+            pendingCommands.clear();
+            // Remove from connections map
+            for (const [key, conn] of connections.entries()) {
+                if (conn.ws === ws) {
+                    connections.delete(key);
+                    break;
+                }
+            }
+        });
+    });
+}
+
+/**
+ * Helper to send a command over an authenticated WebRcon connection.
+ */
+function sendCommand(ws, command, pendingMap) {
+    return new Promise((resolve, reject) => {
+        const id = Date.now() + Math.floor(Math.random() * 1000);
+        const timeout = setTimeout(() => {
+            pendingMap.delete(id);
+            reject(new Error('Command timeout'));
+        }, 10000);
+
+        pendingMap.set(id, { resolve, reject, timeout });
+
+        ws.send(JSON.stringify({
+            Identifier: id,
+            Message: command,
+            Name: "WebRcon"
+        }));
+    });
+}
+
+/**
+ * Gets or creates a WebRcon connection for the given server.
+ */
+async function getWebRcon(ip, port, password) {
+    const key = `${ip}:${port}`;
+    let entry = connections.get(key);
+    if (entry && entry.ws.readyState === WebSocket.OPEN) {
+        console.log(`✅ Reusing existing WebRcon connection for ${key}`);
+        return entry;
+    }
+
+    // Remove stale entry if any
+    if (entry) {
+        entry.close();
+        connections.delete(key);
+    }
+
+    console.log(`🔄 Creating new WebRcon connection for ${key}`);
+    const connection = await createWebRconConnection(ip, port, password);
+    connections.set(key, connection);
+    return connection;
+}
+
 // ---------- API Endpoints ----------
 
 // Health check
@@ -152,46 +240,45 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', connections: connections.size });
 });
 
-// Connect with credentials
+// Connect to server using WebRcon
 app.post('/api/connect', async (req, res) => {
     const { ip, port, password } = req.body;
-    console.log(`[${new Date().toISOString()}] POST /api/connect called with:`, { ip, port, password: '***' });
+    console.log(`[${new Date().toISOString()}] POST /api/connect:`, { ip, port, password: '***' });
 
     try {
-        console.log('🔌 Attempting to get Rcon connection...');
-        const rcon = await getRcon(ip, port, password);
-        console.log('✅ Rcon connection obtained, sending test command...');
-
+        const rcon = await getWebRcon(ip, port, password);
+        // Test command to verify connection
         const result = await rcon.send('status');
-        console.log('📨 Test command response:', result ? result.substring(0, 200) + '...' : '(empty)');
-
+        console.log('📨 Test command response (first 200 chars):', result?.substring(0, 200));
         res.json({ success: true, server: { ip, port, password } });
     } catch (err) {
-        console.error('❌ Error in /api/connect:', err.message);
-        console.error('Stack:', err.stack);
-        console.error('Code:', err.code);
-        res.status(500).json({ success: false, error: err.message, code: err.code });
+        console.error('❌ WebRcon connection error:', err.message);
+        console.error(err.stack);
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// Execute RCON command
+// Execute RCON command via WebRcon
 app.post('/api/command', async (req, res) => {
     const { ip, port, password, command } = req.body;
     console.log(`[${new Date().toISOString()}] POST /api/command:`, { ip, port, command });
 
     try {
-        const rcon = await getRcon(ip, port, password);
+        const rcon = await getWebRcon(ip, port, password);
         const result = await rcon.send(command);
-        console.log(`📨 Command response (first 200 chars):`, result ? result.substring(0, 200) + '...' : '(empty)');
+        console.log('📨 Command response (first 200 chars):', result?.substring(0, 200));
         res.json({ success: true, result });
     } catch (err) {
-        console.error('❌ Error in /api/command:', err.message);
-        console.error('Stack:', err.stack);
+        console.error('❌ WebRcon command error:', err.message);
+        console.error(err.stack);
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// ---------- Combat Logs ----------
+// ---------- All other endpoints (combat logs, claims, zones, etc.) remain exactly the same ----------
+// (Copy them from your existing server.js – they are unchanged)
+
+// Combat Logs
 app.post('/api/combatlog', async (req, res) => {
     const { playerId, playerName, eventType, victim, weapon, distance, timestamp } = req.body;
     try {
@@ -219,7 +306,7 @@ app.get('/api/combatlog/:playerId', async (req, res) => {
     }
 });
 
-// ---------- Claims ----------
+// Claims
 app.post('/api/claim', async (req, res) => {
     const { playerId, itemShortname, quantity, expiresAt } = req.body;
     try {
@@ -247,7 +334,7 @@ app.get('/api/claims/:playerId', async (req, res) => {
     }
 });
 
-// ---------- Zones ----------
+// Zones
 app.get('/api/zones', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM zones');
@@ -282,12 +369,11 @@ app.delete('/api/zones/:id', async (req, res) => {
     }
 });
 
-// ---------- Backup Settings ----------
+// Backup Settings
 app.get('/api/backup-settings', async (req, res) => {
     try {
         const result = await pool.query('SELECT settings FROM backup_settings WHERE id = $1', ['default']);
         if (result.rows.length === 0) {
-            // Return default settings
             res.json({
                 autoBackup: true,
                 interval: 24,
@@ -318,7 +404,7 @@ app.post('/api/backup-settings', async (req, res) => {
     }
 });
 
-// ---------- GPortal Quick Connect Code Resolution ----------
+// GPortal Quick Connect Code Resolution (optional)
 app.post('/api/gportal/resolve', (req, res) => {
     const { code } = req.body;
     console.log(`[${new Date().toISOString()}] POST /api/gportal/resolve with code: ${code}`);
@@ -329,13 +415,13 @@ app.post('/api/gportal/resolve', (req, res) => {
     }
 });
 
-// ---------- Forgot Code / Discord ----------
+// Forgot Code
 app.post('/api/forgot-code', (req, res) => {
     console.log('📧 Forgot code request from user:', req.body.username);
     res.json({ success: true });
 });
 
-// Discord OAuth endpoints – replace with your own Discord app credentials
+// Discord OAuth endpoints
 const DISCORD_CLIENT_ID = '1481899114986733630';
 const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
 const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
@@ -354,7 +440,6 @@ app.get('/api/discord/callback', async (req, res) => {
     }
 
     try {
-        // Exchange code for token
         const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -371,14 +456,12 @@ app.get('/api/discord/callback', async (req, res) => {
             throw new Error('Failed to get access token');
         }
 
-        // Get user info
         const userResponse = await fetch('https://discord.com/api/users/@me', {
             headers: { Authorization: `Bearer ${tokenData.access_token}` }
         });
         const userData = await userResponse.json();
 
         console.log('✅ Discord user linked:', userData.username, userData.id);
-
         res.redirect('https://the-drained-tablet.vercel.app/?discord=linked');
     } catch (err) {
         console.error('❌ Discord OAuth error:', err.message);
