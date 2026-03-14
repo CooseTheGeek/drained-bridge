@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (with Discord user linking and server storage)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (with enhanced logging)
 
 require('dotenv').config();
 const express = require('express');
@@ -323,13 +323,21 @@ app.get('/api/discord/callback', async (req, res) => {
         const username = `discord_${discordId}`;
         const role = 'user';
 
+        console.log(`🔍 Discord callback: received discord_id ${discordId}, username ${userData.username}`);
+
         // Check if user exists
         const existing = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
+        console.log('Existing user query result:', existing.rows);
+
         if (existing.rows.length === 0) {
-            await pool.query(
-                'INSERT INTO users (username, password_hash, role, discord_id) VALUES ($1, $2, $3, $4)',
+            // Insert new user
+            const insertResult = await pool.query(
+                'INSERT INTO users (username, password_hash, role, discord_id) VALUES ($1, $2, $3, $4) RETURNING username',
                 [username, '', role, discordId]
             );
+            console.log('✅ New user inserted:', insertResult.rows[0]);
+        } else {
+            console.log('✅ User already exists:', existing.rows[0].username);
         }
 
         console.log('✅ Discord user linked/stored:', userData.username, discordId);
@@ -353,12 +361,15 @@ function getUserFromRequest(req) {
 // Get user's servers
 app.get('/api/user/servers', async (req, res) => {
     const discordId = getUserFromRequest(req);
+    console.log(`[${new Date().toISOString()}] GET /api/user/servers?discord_id=${discordId}`);
+
     if (!discordId) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
     try {
         const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
+        console.log('User lookup result:', user.rows);
         if (user.rows.length === 0) {
             return res.status(404).json({ error: 'User not found' });
         }
@@ -378,6 +389,8 @@ app.get('/api/user/servers', async (req, res) => {
 // Add a server for the user
 app.post('/api/user/servers', async (req, res) => {
     const discordId = getUserFromRequest(req);
+    console.log(`[${new Date().toISOString()}] POST /api/user/servers?discord_id=${discordId}`, req.body);
+
     if (!discordId) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
@@ -389,8 +402,22 @@ app.post('/api/user/servers', async (req, res) => {
 
     try {
         const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
+        console.log('User lookup for add server:', user.rows);
         if (user.rows.length === 0) {
-            return res.status(404).json({ error: 'User not found' });
+            // Optionally create user on the fly if they don't exist (should not happen if OAuth succeeded)
+            console.log('⚠️ User not found, attempting to create on the fly...');
+            const username = `discord_${discordId}`;
+            await pool.query(
+                'INSERT INTO users (username, password_hash, role, discord_id) VALUES ($1, $2, $3, $4)',
+                [username, '', 'user', discordId]
+            );
+            console.log('✅ User created on the fly');
+            // Re-fetch user
+            const newUser = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
+            if (newUser.rows.length === 0) {
+                return res.status(500).json({ error: 'Failed to create user' });
+            }
+            user.rows = newUser.rows;
         }
         const username = user.rows[0].username;
 
@@ -398,6 +425,7 @@ app.post('/api/user/servers', async (req, res) => {
             'INSERT INTO user_servers (user_id, name, ip, port, password, server_id, region) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
             [username, name, ip, port, password, server_id || null, region || null]
         );
+        console.log('✅ Server added with id:', result.rows[0].id);
         res.json({ success: true, id: result.rows[0].id });
     } catch (err) {
         console.error('Error adding server:', err);
