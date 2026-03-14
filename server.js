@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full rce.js integration)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full rce.js integration, fixed logger)
 
 require('dotenv').config();
 const express = require('express');
@@ -32,13 +32,13 @@ wss.on('connection', (ws) => {
 app.use(cors());
 app.use(express.json());
 
-// PostgreSQL connection pool (unchanged)
+// PostgreSQL connection pool
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-// ---------- Database Setup (unchanged) ----------
+// ---------- Database Setup ----------
 async function initDB() {
     try {
         console.log('📦 Initializing database tables...');
@@ -275,12 +275,12 @@ app.post('/api/command', async (req, res) => {
     }
 });
 
-// ---------- GPortal API via rce.js (corrected) ----------
+// ---------- GPortal API via rce.js (corrected, no file logger) ----------
 let rce = null;
 let serverIdentifier = null;
 
 async function initGPortal() {
-    // For now, we use direct RCON credentials (as per rce.js documentation)
+    // Use direct RCON credentials (as per rce.js documentation)
     const host = '144.126.137.59';
     const port = 28916;
     const password = 'Thatakspray';
@@ -288,11 +288,10 @@ async function initGPortal() {
     try {
         console.log('🔐 Initializing rce.js with direct RCON...');
         
-        // Create the manager with logger options
+        // Create the manager with logger options – no file to avoid permission issues
         rce = new RCEManager({
             logger: {
-                level: LogLevel.Info,
-                file: 'gportal.log'
+                level: LogLevel.Info   // log to console only
             }
         });
 
@@ -352,7 +351,7 @@ app.get('/api/gportal/status', async (req, res) => {
     }
 });
 
-// ---------- Discord OAuth (unchanged) ----------
+// ---------- Discord OAuth ----------
 const DISCORD_CLIENT_ID = '1481899114986733630';
 const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
 const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
@@ -413,7 +412,7 @@ app.get('/api/discord/callback', async (req, res) => {
     }
 });
 
-// ---------- User Server Management (unchanged) ----------
+// ---------- User Server Management ----------
 function getUserFromRequest(req) {
     return req.query.discord_id;
 }
@@ -493,7 +492,7 @@ app.delete('/api/user/servers/:id', async (req, res) => {
     }
 });
 
-// ---------- Combat Logs (unchanged) ----------
+// ---------- Combat Logs ----------
 app.post('/api/combatlog', async (req, res) => {
     const { playerId, playerName, eventType, victim, weapon, distance, timestamp } = req.body;
     try {
@@ -521,7 +520,7 @@ app.get('/api/combatlog/:playerId', async (req, res) => {
     }
 });
 
-// ---------- Claims (unchanged) ----------
+// ---------- Claims ----------
 app.post('/api/claim', async (req, res) => {
     const { playerId, itemShortname, quantity, expiresAt } = req.body;
     try {
@@ -549,7 +548,7 @@ app.get('/api/claims/:playerId', async (req, res) => {
     }
 });
 
-// ---------- Zones (unchanged) ----------
+// ---------- Zones ----------
 app.get('/api/zones', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM zones');
@@ -584,7 +583,7 @@ app.delete('/api/zones/:id', async (req, res) => {
     }
 });
 
-// ---------- Backup Settings (unchanged) ----------
+// ---------- Backup Settings ----------
 app.get('/api/backup-settings', async (req, res) => {
     try {
         const result = await pool.query('SELECT settings FROM backup_settings WHERE id = $1', ['default']);
