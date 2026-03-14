@@ -285,7 +285,7 @@ async function initGPortal() {
     const email = process.env.GPORTAL_EMAIL;
     const password = process.env.GPORTAL_PASSWORD;
     const serverId = process.env.GPORTAL_SERVER_ID;
-    const region = process.env.GPORTAL_REGION; // "US" or "EU"
+    const region = process.env.GPORTAL_REGION;
 
     if (!email || !password || !serverId || !region) {
         console.warn('⚠️ GPortal credentials not set – GPortal API endpoints will be unavailable');
@@ -294,13 +294,16 @@ async function initGPortal() {
 
     try {
         console.log('🔐 Initializing GPortal API with rce.js...');
-        rce = new RCEManager();
+        // Pass logger options to the RCEManager constructor
+        rce = new RCEManager({
+            logger: {
+                level: LogLevel.Info,
+                file: 'gportal.log'
+            }
+        });
         await rce.init({
             username: email,
             password: password
-        }, {
-            level: LogLevel.Info,
-            file: 'gportal.log'
         });
 
         const identifier = 'main-server';
