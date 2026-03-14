@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (WebRcon for Rust CE)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (WebRcon with password in URL)
 // Handles WebRcon connections over WebSockets, persistent database, Discord OAuth, etc.
 
 require('dotenv').config();
@@ -110,7 +110,8 @@ const connections = new Map(); // key: "ip:port", value: { ws, sendCommand, clos
  * @returns {Promise<{send: (cmd: string) => Promise<string>, close: () => void}>}
  */
 async function createWebRconConnection(ip, port, password) {
-    const url = `ws://${ip}:${port}`;
+    // Include password in the WebSocket URL (common for WebRcon)
+    const url = `ws://${ip}:${port}/${password}`;
     console.log(`🔄 Creating WebRcon connection to ${url}`);
 
     return new Promise((resolve, reject) => {
@@ -119,38 +120,21 @@ async function createWebRconConnection(ip, port, password) {
             rejectUnauthorized: false
         });
 
-        let isAuthenticated = false;
         const pendingCommands = new Map(); // id -> { resolve, reject, timeout }
 
         ws.on('open', () => {
-            console.log('✅ WebSocket opened, sending authentication...');
-            // Send authentication message (WebRcon expects JSON with Identifier -1)
-            ws.send(JSON.stringify({
-                Identifier: -1,
-                Message: password,
-                Name: "WebRcon"
-            }));
+            console.log('✅ WebSocket opened, connection ready');
+            // Assume password in URL is sufficient – no separate auth message needed.
+            resolve({
+                send: (command) => sendCommand(ws, command, pendingCommands),
+                close: () => ws.close()
+            });
         });
 
         ws.on('message', (data) => {
             try {
                 const response = JSON.parse(data.toString());
                 console.log('📩 WebRcon message:', response);
-
-                if (response.Identifier === -1) {
-                    if (response.Message === "Success") {
-                        isAuthenticated = true;
-                        console.log('✅ WebRcon authenticated');
-                        // Resolve the promise with the API object
-                        resolve({
-                            send: (command) => sendCommand(ws, command, pendingCommands),
-                            close: () => ws.close()
-                        });
-                    } else {
-                        reject(new Error('Authentication failed: ' + response.Message));
-                    }
-                    return;
-                }
 
                 // Handle command response
                 const pending = pendingCommands.get(response.Identifier);
