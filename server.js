@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (with enhanced logging)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full integration with GPortal API via rce.js)
 
 require('dotenv').config();
 const express = require('express');
@@ -6,6 +6,7 @@ const cors = require('cors');
 const { createServer } = require('http');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
+const { RCEManager, LogLevel } = require('rce.js');
 
 const app = express();
 const httpServer = createServer(app);
@@ -112,7 +113,7 @@ async function initDB() {
 }
 initDB().catch(console.error);
 
-// ---------- WebRcon Connection Management ----------
+// ---------- WebRcon Connection Management (fallback) ----------
 const connections = new Map();
 
 async function createWebRconConnection(ip, port, password) {
@@ -242,7 +243,7 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', connections: connections.size });
 });
 
-// Connect to server (WebRcon)
+// Connect to server (WebRcon) – kept as fallback
 app.post('/api/connect', async (req, res) => {
     const { ip, port, password } = req.body;
     console.log(`[${new Date().toISOString()}] POST /api/connect:`, { ip, port, password: '***' });
@@ -259,7 +260,7 @@ app.post('/api/connect', async (req, res) => {
     }
 });
 
-// Execute RCON command
+// Execute RCON command (WebRcon) – kept as fallback
 app.post('/api/command', async (req, res) => {
     const { ip, port, password, command } = req.body;
     console.log(`[${new Date().toISOString()}] POST /api/command:`, { ip, port, command });
@@ -273,6 +274,82 @@ app.post('/api/command', async (req, res) => {
         console.error('❌ WebRcon command error:', err.message);
         console.error(err.stack);
         res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// ---------- GPortal API via rce.js ----------
+let rce = null;
+let serverIdentifier = null;
+
+async function initGPortal() {
+    const email = process.env.GPORTAL_EMAIL;
+    const password = process.env.GPORTAL_PASSWORD;
+    const serverId = process.env.GPORTAL_SERVER_ID;
+    const region = process.env.GPORTAL_REGION; // "US" or "EU"
+
+    if (!email || !password || !serverId || !region) {
+        console.warn('⚠️ GPortal credentials not set – GPortal API endpoints will be unavailable');
+        return;
+    }
+
+    try {
+        console.log('🔐 Initializing GPortal API with rce.js...');
+        rce = new RCEManager();
+        await rce.init({
+            username: email,
+            password: password
+        }, {
+            level: LogLevel.Info,
+            file: 'gportal.log'
+        });
+
+        const identifier = 'main-server';
+        await rce.servers.add({
+            identifier,
+            serverId: parseInt(serverId),
+            region: region,
+            intents: ['ALL']
+        });
+
+        serverIdentifier = identifier;
+        console.log('✅ GPortal API ready – server added');
+    } catch (err) {
+        console.error('❌ Failed to initialize GPortal API:', err.message);
+        console.error(err.stack);
+    }
+}
+
+// Call init on startup (don't block server start)
+initGPortal();
+
+// Send a command via GPortal API
+app.post('/api/gportal/command', async (req, res) => {
+    const { command } = req.body;
+    if (!command) {
+        return res.status(400).json({ error: 'Command is required' });
+    }
+    if (!rce || !serverIdentifier) {
+        return res.status(503).json({ error: 'GPortal API not initialized' });
+    }
+    try {
+        const result = await rce.servers.sendCommand(serverIdentifier, command);
+        res.json({ success: true, result });
+    } catch (err) {
+        console.error('GPortal command error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get server status via GPortal API
+app.get('/api/gportal/status', async (req, res) => {
+    if (!rce || !serverIdentifier) {
+        return res.status(503).json({ error: 'GPortal API not initialized' });
+    }
+    try {
+        const status = await rce.servers.getStatus(serverIdentifier);
+        res.json(status);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -318,31 +395,21 @@ app.get('/api/discord/callback', async (req, res) => {
         });
         const userData = await userResponse.json();
 
-        // Store or update user in database
         const discordId = userData.id;
         const username = `discord_${discordId}`;
         const role = 'user';
 
-        console.log(`🔍 Discord callback: received discord_id ${discordId}, username ${userData.username}`);
-
         // Check if user exists
         const existing = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-        console.log('Existing user query result:', existing.rows);
-
         if (existing.rows.length === 0) {
-            // Insert new user
-            const insertResult = await pool.query(
-                'INSERT INTO users (username, password_hash, role, discord_id) VALUES ($1, $2, $3, $4) RETURNING username',
+            await pool.query(
+                'INSERT INTO users (username, password_hash, role, discord_id) VALUES ($1, $2, $3, $4)',
                 [username, '', role, discordId]
             );
-            console.log('✅ New user inserted:', insertResult.rows[0]);
-        } else {
-            console.log('✅ User already exists:', existing.rows[0].username);
         }
 
         console.log('✅ Discord user linked/stored:', userData.username, discordId);
 
-        // Redirect back to dashboard with Discord ID in query
         res.redirect(`https://the-drained-tablet.vercel.app/?discord=linked&id=${discordId}`);
     } catch (err) {
         console.error('❌ Discord OAuth error:', err.message);
@@ -352,24 +419,19 @@ app.get('/api/discord/callback', async (req, res) => {
 });
 
 // ---------- User Server Management ----------
-// Helper to get user by Discord ID from query param (simplified; in production use proper auth)
 function getUserFromRequest(req) {
-    const discordId = req.query.discord_id;
-    return discordId;
+    return req.query.discord_id;
 }
 
 // Get user's servers
 app.get('/api/user/servers', async (req, res) => {
     const discordId = getUserFromRequest(req);
-    console.log(`[${new Date().toISOString()}] GET /api/user/servers?discord_id=${discordId}`);
-
     if (!discordId) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
     try {
         const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-        console.log('User lookup result:', user.rows);
         if (user.rows.length === 0) {
             return res.status(404).json({ error: 'User not found' });
         }
@@ -389,8 +451,6 @@ app.get('/api/user/servers', async (req, res) => {
 // Add a server for the user
 app.post('/api/user/servers', async (req, res) => {
     const discordId = getUserFromRequest(req);
-    console.log(`[${new Date().toISOString()}] POST /api/user/servers?discord_id=${discordId}`, req.body);
-
     if (!discordId) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
@@ -402,22 +462,8 @@ app.post('/api/user/servers', async (req, res) => {
 
     try {
         const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-        console.log('User lookup for add server:', user.rows);
         if (user.rows.length === 0) {
-            // Optionally create user on the fly if they don't exist (should not happen if OAuth succeeded)
-            console.log('⚠️ User not found, attempting to create on the fly...');
-            const username = `discord_${discordId}`;
-            await pool.query(
-                'INSERT INTO users (username, password_hash, role, discord_id) VALUES ($1, $2, $3, $4)',
-                [username, '', 'user', discordId]
-            );
-            console.log('✅ User created on the fly');
-            // Re-fetch user
-            const newUser = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-            if (newUser.rows.length === 0) {
-                return res.status(500).json({ error: 'Failed to create user' });
-            }
-            user.rows = newUser.rows;
+            return res.status(404).json({ error: 'User not found' });
         }
         const username = user.rows[0].username;
 
@@ -425,7 +471,6 @@ app.post('/api/user/servers', async (req, res) => {
             'INSERT INTO user_servers (user_id, name, ip, port, password, server_id, region) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
             [username, name, ip, port, password, server_id || null, region || null]
         );
-        console.log('✅ Server added with id:', result.rows[0].id);
         res.json({ success: true, id: result.rows[0].id });
     } catch (err) {
         console.error('Error adding server:', err);
