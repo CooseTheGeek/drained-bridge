@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full integration with GPortal API via rce.js)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full rce.js integration)
 
 require('dotenv').config();
 const express = require('express');
@@ -6,7 +6,7 @@ const cors = require('cors');
 const { createServer } = require('http');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
-const { RCEManager, LogLevel } = require('rce.js');
+const { default: RCEManager, LogLevel } = require('rce.js'); // Correct import
 
 const app = express();
 const httpServer = createServer(app);
@@ -32,13 +32,13 @@ wss.on('connection', (ws) => {
 app.use(cors());
 app.use(express.json());
 
-// PostgreSQL connection pool
+// PostgreSQL connection pool (unchanged)
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-// ---------- Database Setup ----------
+// ---------- Database Setup (unchanged) ----------
 async function initDB() {
     try {
         console.log('📦 Initializing database tables...');
@@ -89,9 +89,7 @@ async function initDB() {
                 id TEXT PRIMARY KEY DEFAULT 'default',
                 settings JSONB NOT NULL
             );
-            -- Add discord_id to users if not exists
             ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_id TEXT;
-            -- Create user_servers table
             CREATE TABLE IF NOT EXISTS user_servers (
                 id SERIAL PRIMARY KEY,
                 user_id TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
@@ -277,47 +275,43 @@ app.post('/api/command', async (req, res) => {
     }
 });
 
-// ---------- GPortal API via rce.js ----------
+// ---------- GPortal API via rce.js (corrected) ----------
 let rce = null;
 let serverIdentifier = null;
 
 async function initGPortal() {
-    const email = process.env.GPORTAL_EMAIL;
-    const password = process.env.GPORTAL_PASSWORD;
-    const serverId = process.env.GPORTAL_SERVER_ID;
-    const region = process.env.GPORTAL_REGION;
-
-    if (!email || !password || !serverId || !region) {
-        console.warn('⚠️ GPortal credentials not set – GPortal API endpoints will be unavailable');
-        return;
-    }
+    // For now, we use direct RCON credentials (as per rce.js documentation)
+    const host = '144.126.137.59';
+    const port = 28916;
+    const password = 'Thatakspray';
 
     try {
-        console.log('🔐 Initializing GPortal API with rce.js...');
-        // Pass logger options to the RCEManager constructor
+        console.log('🔐 Initializing rce.js with direct RCON...');
+        
+        // Create the manager with logger options
         rce = new RCEManager({
             logger: {
                 level: LogLevel.Info,
                 file: 'gportal.log'
             }
         });
-        await rce.init({
-            username: email,
-            password: password
+
+        // Add server using rce.addServer() – as shown in documentation
+        await rce.addServer({
+            identifier: 'main-server',
+            rcon: {
+                host,
+                port,
+                password,
+            },
+            state: [],                // optional custom data
+            intents: ['ALL']           // subscribe to all events
         });
 
-        const identifier = 'main-server';
-        await rce.servers.add({
-            identifier,
-            serverId: parseInt(serverId),
-            region: region,
-            intents: ['ALL']
-        });
-
-        serverIdentifier = identifier;
-        console.log('✅ GPortal API ready – server added');
+        serverIdentifier = 'main-server';
+        console.log('✅ rce.js ready – server added');
     } catch (err) {
-        console.error('❌ Failed to initialize GPortal API:', err.message);
+        console.error('❌ Failed to initialize rce.js:', err.message);
         console.error(err.stack);
     }
 }
@@ -325,7 +319,7 @@ async function initGPortal() {
 // Call init on startup (don't block server start)
 initGPortal();
 
-// Send a command via GPortal API
+// Send a command via rce.js
 app.post('/api/gportal/command', async (req, res) => {
     const { command } = req.body;
     if (!command) {
@@ -335,7 +329,8 @@ app.post('/api/gportal/command', async (req, res) => {
         return res.status(503).json({ error: 'GPortal API not initialized' });
     }
     try {
-        const result = await rce.servers.sendCommand(serverIdentifier, command);
+        // Use rce.sendCommand() as per documentation
+        const result = await rce.sendCommand(serverIdentifier, command);
         res.json({ success: true, result });
     } catch (err) {
         console.error('GPortal command error:', err);
@@ -343,20 +338,21 @@ app.post('/api/gportal/command', async (req, res) => {
     }
 });
 
-// Get server status via GPortal API
+// Get server status via rce.js
 app.get('/api/gportal/status', async (req, res) => {
     if (!rce || !serverIdentifier) {
         return res.status(503).json({ error: 'GPortal API not initialized' });
     }
     try {
-        const status = await rce.servers.getStatus(serverIdentifier);
-        res.json(status);
+        // Use rce.fetchInfo() to get server info
+        const info = await rce.fetchInfo(serverIdentifier);
+        res.json(info);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// ---------- Discord OAuth ----------
+// ---------- Discord OAuth (unchanged) ----------
 const DISCORD_CLIENT_ID = '1481899114986733630';
 const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
 const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
@@ -375,7 +371,6 @@ app.get('/api/discord/callback', async (req, res) => {
     }
 
     try {
-        // Exchange code for token
         const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -392,7 +387,6 @@ app.get('/api/discord/callback', async (req, res) => {
             throw new Error('Failed to get access token');
         }
 
-        // Get user info
         const userResponse = await fetch('https://discord.com/api/users/@me', {
             headers: { Authorization: `Bearer ${tokenData.access_token}` }
         });
@@ -402,7 +396,6 @@ app.get('/api/discord/callback', async (req, res) => {
         const username = `discord_${discordId}`;
         const role = 'user';
 
-        // Check if user exists
         const existing = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
         if (existing.rows.length === 0) {
             await pool.query(
@@ -412,7 +405,6 @@ app.get('/api/discord/callback', async (req, res) => {
         }
 
         console.log('✅ Discord user linked/stored:', userData.username, discordId);
-
         res.redirect(`https://the-drained-tablet.vercel.app/?discord=linked&id=${discordId}`);
     } catch (err) {
         console.error('❌ Discord OAuth error:', err.message);
@@ -421,12 +413,11 @@ app.get('/api/discord/callback', async (req, res) => {
     }
 });
 
-// ---------- User Server Management ----------
+// ---------- User Server Management (unchanged) ----------
 function getUserFromRequest(req) {
     return req.query.discord_id;
 }
 
-// Get user's servers
 app.get('/api/user/servers', async (req, res) => {
     const discordId = getUserFromRequest(req);
     if (!discordId) {
@@ -451,7 +442,6 @@ app.get('/api/user/servers', async (req, res) => {
     }
 });
 
-// Add a server for the user
 app.post('/api/user/servers', async (req, res) => {
     const discordId = getUserFromRequest(req);
     if (!discordId) {
@@ -481,7 +471,6 @@ app.post('/api/user/servers', async (req, res) => {
     }
 });
 
-// Delete a server
 app.delete('/api/user/servers/:id', async (req, res) => {
     const discordId = getUserFromRequest(req);
     if (!discordId) {
@@ -504,7 +493,7 @@ app.delete('/api/user/servers/:id', async (req, res) => {
     }
 });
 
-// ---------- Combat Logs ----------
+// ---------- Combat Logs (unchanged) ----------
 app.post('/api/combatlog', async (req, res) => {
     const { playerId, playerName, eventType, victim, weapon, distance, timestamp } = req.body;
     try {
@@ -532,7 +521,7 @@ app.get('/api/combatlog/:playerId', async (req, res) => {
     }
 });
 
-// ---------- Claims ----------
+// ---------- Claims (unchanged) ----------
 app.post('/api/claim', async (req, res) => {
     const { playerId, itemShortname, quantity, expiresAt } = req.body;
     try {
@@ -560,7 +549,7 @@ app.get('/api/claims/:playerId', async (req, res) => {
     }
 });
 
-// ---------- Zones ----------
+// ---------- Zones (unchanged) ----------
 app.get('/api/zones', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM zones');
@@ -595,7 +584,7 @@ app.delete('/api/zones/:id', async (req, res) => {
     }
 });
 
-// ---------- Backup Settings ----------
+// ---------- Backup Settings (unchanged) ----------
 app.get('/api/backup-settings', async (req, res) => {
     try {
         const result = await pool.query('SELECT settings FROM backup_settings WHERE id = $1', ['default']);
