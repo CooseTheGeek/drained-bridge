@@ -89,7 +89,6 @@ async function initDB() {
                 id TEXT PRIMARY KEY DEFAULT 'default',
                 settings JSONB NOT NULL
             );
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_id TEXT;
             CREATE TABLE IF NOT EXISTS user_servers (
                 id SERIAL PRIMARY KEY,
                 user_id TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
@@ -114,6 +113,19 @@ async function initDB() {
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             );
+        `);
+        
+        // Add discord_id column if not exists (for older databases)
+        await pool.query(`
+            DO $$ 
+            BEGIN 
+                BEGIN
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_id TEXT;
+                EXCEPTION
+                    WHEN duplicate_column THEN 
+                        NULL;
+                END;
+            END $$;
         `);
         
         console.log('✅ Database tables ready');
@@ -360,7 +372,7 @@ app.get('/api/gportal/status', async (req, res) => {
     }
 });
 
-// ---------- Discord OAuth ----------
+// ---------- Discord OAuth (with robust error handling) ----------
 const DISCORD_CLIENT_ID = '1481899114986733630';
 const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
 const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
@@ -390,6 +402,15 @@ app.get('/api/discord/callback', async (req, res) => {
                 redirect_uri: REDIRECT_URI
             })
         });
+
+        // Check if response is OK (status 200)
+        if (!tokenResponse.ok) {
+            const errorText = await tokenResponse.text();
+            console.error('❌ Discord token error response:', errorText);
+            // Redirect to frontend with error parameter
+            return res.redirect(`https://the-drained-tablet.vercel.app/?discord=error&details=${encodeURIComponent(errorText.substring(0, 200))}`);
+        }
+
         const tokenData = await tokenResponse.json();
         if (!tokenData.access_token) {
             throw new Error('Failed to get access token');
@@ -398,6 +419,13 @@ app.get('/api/discord/callback', async (req, res) => {
         const userResponse = await fetch('https://discord.com/api/users/@me', {
             headers: { Authorization: `Bearer ${tokenData.access_token}` }
         });
+
+        if (!userResponse.ok) {
+            const errorText = await userResponse.text();
+            console.error('❌ Discord user error response:', errorText);
+            throw new Error('Failed to fetch user data');
+        }
+
         const userData = await userResponse.json();
 
         const discordId = userData.id;
@@ -417,7 +445,7 @@ app.get('/api/discord/callback', async (req, res) => {
     } catch (err) {
         console.error('❌ Discord OAuth error:', err.message);
         console.error(err.stack);
-        res.status(500).send('Discord authentication failed');
+        res.redirect('https://the-drained-tablet.vercel.app/?discord=error&message=' + encodeURIComponent(err.message));
     }
 });
 
