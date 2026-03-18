@@ -372,7 +372,7 @@ app.get('/api/gportal/status', async (req, res) => {
     }
 });
 
-// ---------- Discord OAuth (with robust error handling) ----------
+// ---------- Discord OAuth (with robust error handling and proper headers) ----------
 const DISCORD_CLIENT_ID = '1481899114986733630';
 const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
 const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
@@ -391,9 +391,14 @@ app.get('/api/discord/callback', async (req, res) => {
     }
 
     try {
+        // Add User-Agent and Accept headers to avoid Cloudflare challenges
         const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'DrainedTabletBridge/7.0.0',
+                'Accept': 'application/json'
+            },
             body: new URLSearchParams({
                 client_id: DISCORD_CLIENT_ID,
                 client_secret: DISCORD_CLIENT_SECRET,
@@ -417,7 +422,10 @@ app.get('/api/discord/callback', async (req, res) => {
         }
 
         const userResponse = await fetch('https://discord.com/api/users/@me', {
-            headers: { Authorization: `Bearer ${tokenData.access_token}` }
+            headers: {
+                Authorization: `Bearer ${tokenData.access_token}`,
+                'User-Agent': 'DrainedTabletBridge/7.0.0'
+            }
         });
 
         if (!userResponse.ok) {
