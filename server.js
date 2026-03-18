@@ -89,6 +89,7 @@ async function initDB() {
                 id TEXT PRIMARY KEY DEFAULT 'default',
                 settings JSONB NOT NULL
             );
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_id TEXT;
             CREATE TABLE IF NOT EXISTS user_servers (
                 id SERIAL PRIMARY KEY,
                 user_id TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
@@ -113,19 +114,6 @@ async function initDB() {
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             );
-        `);
-        
-        // Add discord_id column if not exists (for older databases)
-        await pool.query(`
-            DO $$ 
-            BEGIN 
-                BEGIN
-                    ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_id TEXT;
-                EXCEPTION
-                    WHEN duplicate_column THEN 
-                        NULL;
-                END;
-            END $$;
         `);
         
         console.log('✅ Database tables ready');
@@ -716,7 +704,6 @@ app.delete('/api/shop/items/:id', async (req, res) => {
 app.post('/api/shop/purchase', async (req, res) => {
     const { playerId, itemShortname, quantity } = req.body;
     try {
-        // In a real economy, you'd deduct coins here. For now, just create claim.
         await pool.query(
             'INSERT INTO claims (player_id, item_shortname, quantity, expires_at) VALUES ($1, $2, $3, NULL)',
             [playerId, itemShortname, quantity]
