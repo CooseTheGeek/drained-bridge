@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full rce.js integration, fixed logger)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full rce.js integration, fixed logger, with shop system)
 
 require('dotenv').config();
 const express = require('express');
@@ -30,7 +30,7 @@ wss.on('connection', (ws) => {
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' })); // Increased limit for images
 
 // PostgreSQL connection pool
 const pool = new Pool({
@@ -89,7 +89,6 @@ async function initDB() {
                 id TEXT PRIMARY KEY DEFAULT 'default',
                 settings JSONB NOT NULL
             );
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_id TEXT;
             CREATE TABLE IF NOT EXISTS user_servers (
                 id SERIAL PRIMARY KEY,
                 user_id TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
@@ -101,7 +100,34 @@ async function initDB() {
                 region TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             );
+            CREATE TABLE IF NOT EXISTS shop_items (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                shortname TEXT NOT NULL,
+                price INTEGER NOT NULL,
+                stock INTEGER NOT NULL DEFAULT -1,
+                category TEXT,
+                image TEXT,
+                command TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
         `);
+        
+        // Add discord_id column if not exists (for older databases)
+        await pool.query(`
+            DO $$ 
+            BEGIN 
+                BEGIN
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_id TEXT;
+                EXCEPTION
+                    WHEN duplicate_column THEN 
+                        NULL;
+                END;
+            END $$;
+        `);
+        
         console.log('✅ Database tables ready');
     } catch (err) {
         console.error('❌ Database initialization error:', err.message);
@@ -275,12 +301,12 @@ app.post('/api/command', async (req, res) => {
     }
 });
 
-// ---------- GPortal API via rce.js (corrected, no file logger) ----------
+// ---------- GPortal API via rce.js ----------
 let rce = null;
 let serverIdentifier = null;
 
 async function initGPortal() {
-    // Use direct RCON credentials (as per rce.js documentation)
+    // Use direct RCON credentials
     const host = '144.126.137.59';
     const port = 28916;
     const password = 'Thatakspray';
@@ -288,14 +314,12 @@ async function initGPortal() {
     try {
         console.log('🔐 Initializing rce.js with direct RCON...');
         
-        // Create the manager with logger options – no file to avoid permission issues
         rce = new RCEManager({
             logger: {
-                level: LogLevel.Info   // log to console only
+                level: LogLevel.Info
             }
         });
 
-        // Add server using rce.addServer() – as shown in documentation
         await rce.addServer({
             identifier: 'main-server',
             rcon: {
@@ -303,8 +327,8 @@ async function initGPortal() {
                 port,
                 password,
             },
-            state: [],                // optional custom data
-            intents: ['ALL']           // subscribe to all events
+            state: [],
+            intents: ['ALL']
         });
 
         serverIdentifier = 'main-server';
@@ -315,7 +339,6 @@ async function initGPortal() {
     }
 }
 
-// Call init on startup (don't block server start)
 initGPortal();
 
 // Send a command via rce.js
@@ -328,7 +351,6 @@ app.post('/api/gportal/command', async (req, res) => {
         return res.status(503).json({ error: 'GPortal API not initialized' });
     }
     try {
-        // Use rce.sendCommand() as per documentation
         const result = await rce.sendCommand(serverIdentifier, command);
         res.json({ success: true, result });
     } catch (err) {
@@ -343,7 +365,6 @@ app.get('/api/gportal/status', async (req, res) => {
         return res.status(503).json({ error: 'GPortal API not initialized' });
     }
     try {
-        // Use rce.fetchInfo() to get server info
         const info = await rce.fetchInfo(serverIdentifier);
         res.json(info);
     } catch (err) {
@@ -618,7 +639,7 @@ app.post('/api/backup-settings', async (req, res) => {
     }
 });
 
-// ---------- GPortal Quick Connect Code Resolution (optional) ----------
+// ---------- GPortal Quick Connect Code Resolution ----------
 app.post('/api/gportal/resolve', (req, res) => {
     const { code } = req.body;
     console.log(`[${new Date().toISOString()}] POST /api/gportal/resolve with code: ${code}`);
@@ -633,6 +654,78 @@ app.post('/api/gportal/resolve', (req, res) => {
 app.post('/api/forgot-code', (req, res) => {
     console.log('📧 Forgot code request from user:', req.body.username);
     res.json({ success: true });
+});
+
+// ==================== SHOP API ====================
+
+// GET all shop items
+app.get('/api/shop/items', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM shop_items ORDER BY category, name');
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching shop items:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST a new shop item
+app.post('/api/shop/items', async (req, res) => {
+    const { name, description, shortname, price, stock, category, image, command } = req.body;
+    try {
+        const result = await pool.query(
+            `INSERT INTO shop_items (name, description, shortname, price, stock, category, image, command)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+            [name, description, shortname, price, stock, category, image, command]
+        );
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error creating shop item:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT update an item
+app.put('/api/shop/items/:id', async (req, res) => {
+    const { name, description, shortname, price, stock, category, image, command } = req.body;
+    try {
+        const result = await pool.query(
+            `UPDATE shop_items SET name=$1, description=$2, shortname=$3, price=$4, stock=$5,
+             category=$6, image=$7, command=$8, updated_at=NOW() WHERE id=$9 RETURNING *`,
+            [name, description, shortname, price, stock, category, image, command, req.params.id]
+        );
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error updating shop item:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// DELETE an item
+app.delete('/api/shop/items/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM shop_items WHERE id = $1', [req.params.id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error deleting shop item:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/shop/purchase – creates a claim
+app.post('/api/shop/purchase', async (req, res) => {
+    const { playerId, itemShortname, quantity } = req.body;
+    try {
+        // In a real economy, you'd deduct coins here. For now, just create claim.
+        await pool.query(
+            'INSERT INTO claims (player_id, item_shortname, quantity, expires_at) VALUES ($1, $2, $3, NULL)',
+            [playerId, itemShortname, quantity]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error creating claim:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 const PORT = process.env.PORT || 3000;
