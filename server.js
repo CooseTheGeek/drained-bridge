@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (with Discord retry and disabled rce.js)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (with user-based server management)
 
 require('dotenv').config();
 const express = require('express');
@@ -126,6 +126,13 @@ async function initDB() {
                 END;
             END $$;
         `);
+        
+        // Ensure master user exists
+        await pool.query(
+            `INSERT INTO users (username, password_hash, role, discord_id)
+             VALUES ('CooseTheGeek', '', 'master', NULL)
+             ON CONFLICT (username) DO NOTHING`
+        );
         
         console.log('✅ Database tables ready');
     } catch (err) {
@@ -258,6 +265,16 @@ async function getWebRcon(ip, port, password) {
     }
 }
 
+// ---------- Helper: get user identifier from request ----------
+function getUserFromRequest(req) {
+    // Try discord_id (legacy), then username from query or body
+    const discordId = req.query.discord_id;
+    if (discordId) return discordId;
+    const username = req.query.username || req.body.username;
+    if (username) return username;
+    return null;
+}
+
 // ---------- API Endpoints ----------
 
 // Health check
@@ -301,197 +318,38 @@ app.post('/api/command', async (req, res) => {
 });
 
 // ---------- GPortal API via rce.js (disabled) ----------
-/*
-let rce = null;
-let serverIdentifier = null;
+// (Commented out to avoid errors)
 
-async function initGPortal() {
-    const host = '144.126.137.59';
-    const port = 28916;
-    const password = 'Thatakspray';
-
-    try {
-        console.log('🔐 Initializing rce.js with direct RCON...');
-        
-        rce = new RCEManager({
-            logger: {
-                level: LogLevel.Info
-            }
-        });
-
-        await rce.addServer({
-            identifier: 'main-server',
-            rcon: {
-                host,
-                port,
-                password,
-            },
-            state: [],
-            intents: ['ALL']
-        });
-
-        serverIdentifier = 'main-server';
-        console.log('✅ rce.js ready – server added');
-    } catch (err) {
-        console.error('❌ Failed to initialize rce.js:', err.message);
-        console.error(err.stack);
-    }
-}
-
-app.post('/api/gportal/command', async (req, res) => {
-    const { command } = req.body;
-    if (!command) {
-        return res.status(400).json({ error: 'Command is required' });
-    }
-    if (!rce || !serverIdentifier) {
-        return res.status(503).json({ error: 'GPortal API not initialized' });
-    }
-    try {
-        const result = await rce.sendCommand(serverIdentifier, command);
-        res.json({ success: true, result });
-    } catch (err) {
-        console.error('GPortal command error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/api/gportal/status', async (req, res) => {
-    if (!rce || !serverIdentifier) {
-        return res.status(503).json({ error: 'GPortal API not initialized' });
-    }
-    try {
-        const info = await rce.fetchInfo(serverIdentifier);
-        res.json(info);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-*/
-// GPortal endpoints disabled to avoid connection errors
-
-// ---------- Discord OAuth (with improved error logging) ----------
-const DISCORD_CLIENT_ID = '1481899114986733630';
-const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
-const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
-
-app.get('/api/discord/login', (req, res) => {
-    console.log(`[${new Date().toISOString()}] GET /api/discord/login - redirecting to Discord`);
-    const discordAuthUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify`;
-    res.redirect(discordAuthUrl);
-});
-
-app.get('/api/discord/callback', async (req, res) => {
-    const { code } = req.query;
-    console.log(`[${new Date().toISOString()}] GET /api/discord/callback with code: ${code ? 'present' : 'missing'}`);
-    if (!code) {
-        return res.status(400).send('No code provided');
-    }
-
-    const maxRetries = 3;
-    let retryCount = 0;
-    let retryDelay = 1000; // Start with 1 second
-
-    while (retryCount < maxRetries) {
-        try {
-            const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'User-Agent': 'DrainedTabletBridge/7.0.0',
-                    'Accept': 'application/json'
-                },
-                body: new URLSearchParams({
-                    client_id: DISCORD_CLIENT_ID,
-                    client_secret: DISCORD_CLIENT_SECRET,
-                    grant_type: 'authorization_code',
-                    code,
-                    redirect_uri: REDIRECT_URI
-                })
-            });
-
-            if (tokenResponse.status === 429) {
-                const errorData = await tokenResponse.json();
-                console.error('❌ Discord rate limit details:', errorData);
-                const retryAfter = errorData.retry_after || 30;
-                console.log(`⏳ Rate limited. Waiting ${retryAfter} seconds before retry ${retryCount + 1}/${maxRetries}`);
-                await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-                retryCount++;
-                continue;
-            }
-
-            if (!tokenResponse.ok) {
-                const errorText = await tokenResponse.text();
-                console.error('❌ Discord token error response:', errorText);
-                return res.redirect(`https://the-drained-tablet.vercel.app/?discord=error&details=${encodeURIComponent(errorText.substring(0, 200))}`);
-            }
-
-            const tokenData = await tokenResponse.json();
-            if (!tokenData.access_token) {
-                throw new Error('Failed to get access token');
-            }
-
-            const userResponse = await fetch('https://discord.com/api/users/@me', {
-                headers: {
-                    Authorization: `Bearer ${tokenData.access_token}`,
-                    'User-Agent': 'DrainedTabletBridge/7.0.0'
-                }
-            });
-
-            if (!userResponse.ok) {
-                const errorText = await userResponse.text();
-                console.error('❌ Discord user error response:', errorText);
-                throw new Error('Failed to fetch user data');
-            }
-
-            const userData = await userResponse.json();
-
-            const discordId = userData.id;
-            const username = `discord_${discordId}`;
-            const role = 'user';
-
-            const existing = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-            if (existing.rows.length === 0) {
-                await pool.query(
-                    'INSERT INTO users (username, password_hash, role, discord_id) VALUES ($1, $2, $3, $4)',
-                    [username, '', role, discordId]
-                );
-            }
-
-            console.log('✅ Discord user linked/stored:', userData.username, discordId);
-            return res.redirect(`https://the-drained-tablet.vercel.app/?discord=linked&id=${discordId}`);
-
-        } catch (err) {
-            console.error('❌ Discord OAuth error:', err.message);
-            console.error(err.stack);
-            return res.redirect('https://the-drained-tablet.vercel.app/?discord=error&message=' + encodeURIComponent(err.message));
-        }
-    }
-
-    // If we exhaust retries
-    res.redirect('https://the-drained-tablet.vercel.app/?discord=error&message=Rate%20limited%20after%20multiple%20retries');
-});
+// ---------- Discord OAuth (commented out) ----------
+// We removed Discord endpoints entirely to simplify.
 
 // ---------- User Server Management ----------
-function getUserFromRequest(req) {
-    return req.query.discord_id;
-}
-
 app.get('/api/user/servers', async (req, res) => {
-    const discordId = getUserFromRequest(req);
-    if (!discordId) {
+    const identifier = getUserFromRequest(req);
+    if (!identifier) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
     try {
-        const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-        if (user.rows.length === 0) {
-            return res.status(404).json({ error: 'User not found' });
+        let userId;
+        if (identifier.startsWith('discord_')) {
+            const userRes = await pool.query('SELECT username FROM users WHERE discord_id = $1', [identifier]);
+            if (userRes.rows.length === 0) {
+                return res.status(404).json({ error: 'User not found' });
+            }
+            userId = userRes.rows[0].username;
+        } else {
+            userId = identifier;
+            // Verify user exists
+            const userRes = await pool.query('SELECT username FROM users WHERE username = $1', [userId]);
+            if (userRes.rows.length === 0) {
+                return res.status(404).json({ error: 'User not found' });
+            }
         }
-        const username = user.rows[0].username;
 
         const result = await pool.query(
             'SELECT id, name, ip, port, server_id, region, created_at FROM user_servers WHERE user_id = $1 ORDER BY created_at DESC',
-            [username]
+            [userId]
         );
         res.json(result.rows);
     } catch (err) {
@@ -501,26 +359,36 @@ app.get('/api/user/servers', async (req, res) => {
 });
 
 app.post('/api/user/servers', async (req, res) => {
-    const discordId = getUserFromRequest(req);
-    if (!discordId) {
+    const identifier = getUserFromRequest(req);
+    if (!identifier) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
-    const { name, ip, port, password, server_id, region } = req.body;
+    const { name, ip, port, password, server_id, region, username } = req.body;
     if (!name || !ip || !port || !password) {
         return res.status(400).json({ error: 'Missing required fields' });
     }
 
     try {
-        const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-        if (user.rows.length === 0) {
-            return res.status(404).json({ error: 'User not found' });
+        let userId;
+        if (identifier.startsWith('discord_')) {
+            const userRes = await pool.query('SELECT username FROM users WHERE discord_id = $1', [identifier]);
+            if (userRes.rows.length === 0) {
+                return res.status(404).json({ error: 'User not found' });
+            }
+            userId = userRes.rows[0].username;
+        } else {
+            userId = identifier;
+            // Verify user exists
+            const userRes = await pool.query('SELECT username FROM users WHERE username = $1', [userId]);
+            if (userRes.rows.length === 0) {
+                return res.status(404).json({ error: 'User not found' });
+            }
         }
-        const username = user.rows[0].username;
 
         const result = await pool.query(
             'INSERT INTO user_servers (user_id, name, ip, port, password, server_id, region) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
-            [username, name, ip, port, password, server_id || null, region || null]
+            [userId, name, ip, port, password, server_id || null, region || null]
         );
         res.json({ success: true, id: result.rows[0].id });
     } catch (err) {
@@ -530,20 +398,29 @@ app.post('/api/user/servers', async (req, res) => {
 });
 
 app.delete('/api/user/servers/:id', async (req, res) => {
-    const discordId = getUserFromRequest(req);
-    if (!discordId) {
+    const identifier = getUserFromRequest(req);
+    if (!identifier) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
     const serverId = req.params.id;
     try {
-        const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-        if (user.rows.length === 0) {
-            return res.status(404).json({ error: 'User not found' });
+        let userId;
+        if (identifier.startsWith('discord_')) {
+            const userRes = await pool.query('SELECT username FROM users WHERE discord_id = $1', [identifier]);
+            if (userRes.rows.length === 0) {
+                return res.status(404).json({ error: 'User not found' });
+            }
+            userId = userRes.rows[0].username;
+        } else {
+            userId = identifier;
+            const userRes = await pool.query('SELECT username FROM users WHERE username = $1', [userId]);
+            if (userRes.rows.length === 0) {
+                return res.status(404).json({ error: 'User not found' });
+            }
         }
-        const username = user.rows[0].username;
 
-        await pool.query('DELETE FROM user_servers WHERE id = $1 AND user_id = $2', [serverId, username]);
+        await pool.query('DELETE FROM user_servers WHERE id = $1 AND user_id = $2', [serverId, userId]);
         res.json({ success: true });
     } catch (err) {
         console.error('Error deleting server:', err);
