@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full rce.js integration, fixed logger, with shop system)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (with Discord retry and disabled rce.js)
 
 require('dotenv').config();
 const express = require('express');
@@ -6,7 +6,7 @@ const cors = require('cors');
 const { createServer } = require('http');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
-const { default: RCEManager, LogLevel } = require('rce.js'); // Correct import
+// const { default: RCEManager, LogLevel } = require('rce.js'); // disabled
 
 const app = express();
 const httpServer = createServer(app);
@@ -30,7 +30,7 @@ wss.on('connection', (ws) => {
 });
 
 app.use(cors());
-app.use(express.json({ limit: '50mb' })); // Increased limit for images
+app.use(express.json({ limit: '50mb' }));
 
 // PostgreSQL connection pool
 const pool = new Pool({
@@ -115,7 +115,6 @@ async function initDB() {
             );
         `);
         
-        // Add discord_id column if not exists (for older databases)
         await pool.query(`
             DO $$ 
             BEGIN 
@@ -301,12 +300,12 @@ app.post('/api/command', async (req, res) => {
     }
 });
 
-// ---------- GPortal API via rce.js ----------
+// ---------- GPortal API via rce.js (disabled) ----------
+/*
 let rce = null;
 let serverIdentifier = null;
 
 async function initGPortal() {
-    // Use direct RCON credentials
     const host = '144.126.137.59';
     const port = 28916;
     const password = 'Thatakspray';
@@ -339,9 +338,6 @@ async function initGPortal() {
     }
 }
 
-initGPortal();
-
-// Send a command via rce.js
 app.post('/api/gportal/command', async (req, res) => {
     const { command } = req.body;
     if (!command) {
@@ -359,7 +355,6 @@ app.post('/api/gportal/command', async (req, res) => {
     }
 });
 
-// Get server status via rce.js
 app.get('/api/gportal/status', async (req, res) => {
     if (!rce || !serverIdentifier) {
         return res.status(503).json({ error: 'GPortal API not initialized' });
@@ -371,8 +366,10 @@ app.get('/api/gportal/status', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+*/
+// GPortal endpoints disabled to avoid connection errors
 
-// ---------- Discord OAuth (with robust error handling and retry logic) ----------
+// ---------- Discord OAuth (with improved error logging) ----------
 const DISCORD_CLIENT_ID = '1481899114986733630';
 const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
 const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
@@ -414,7 +411,8 @@ app.get('/api/discord/callback', async (req, res) => {
 
             if (tokenResponse.status === 429) {
                 const errorData = await tokenResponse.json();
-                const retryAfter = errorData.retry_after || 30; // Default to 30 seconds
+                console.error('❌ Discord rate limit details:', errorData);
+                const retryAfter = errorData.retry_after || 30;
                 console.log(`⏳ Rate limited. Waiting ${retryAfter} seconds before retry ${retryCount + 1}/${maxRetries}`);
                 await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
                 retryCount++;
