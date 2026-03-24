@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (using TCP RCON for Rust Console)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (with rcon-client for TCP RCON)
 
 require('dotenv').config();
 const express = require('express');
@@ -149,33 +149,41 @@ const connections = new Map();
 async function getRcon(ip, port, password) {
     const key = `${ip}:${port}`;
     let entry = connections.get(key);
-    if (entry && entry.client && entry.client.socket && !entry.client.socket.destroyed) {
-        console.log(`✅ Reusing existing RCON connection for ${key}`);
+    if (entry && entry.rcon && entry.rcon.connected) {
+        console.log(`✅ Reusing existing Rcon connection for ${key}`);
         return entry;
     }
 
     if (entry) {
-        try {
-            entry.client.end();
-        } catch (e) {}
+        try { await entry.rcon.disconnect(); } catch(e) {}
         connections.delete(key);
     }
 
-    console.log(`🔄 Creating new TCP RCON connection to ${ip}:${port}`);
-    const client = await Rcon.connect({
-        host: ip,
-        port: port,
-        password: password
-    });
-    console.log(`✅ TCP RCON connected to ${ip}:${port}`);
-    const wrapper = {
-        send: async (command) => {
-            return await client.send(command);
-        },
-        close: () => client.end()
-    };
-    connections.set(key, wrapper);
-    return wrapper;
+    console.log(`🔄 Creating new TCP Rcon connection to ${ip}:${port}`);
+    try {
+        const rcon = new Rcon({
+            host: ip,
+            port: port,
+            password: password,
+            timeout: 10000
+        });
+        await rcon.connect();
+        const connection = {
+            rcon: rcon,
+            send: async (command) => {
+                return await rcon.send(command);
+            },
+            close: async () => {
+                await rcon.disconnect();
+            }
+        };
+        connections.set(key, connection);
+        console.log(`✅ Rcon connection established to ${ip}:${port}`);
+        return connection;
+    } catch (err) {
+        console.error(`❌ Rcon connection error:`, err.message);
+        throw err;
+    }
 }
 
 // ---------- API Endpoints ----------
@@ -203,7 +211,7 @@ app.post('/api/connect', async (req, res) => {
     }
 });
 
-// Execute RCON command (TCP)
+// Execute RCON command
 app.post('/api/command', async (req, res) => {
     const { ip, port, password, command } = req.body;
     console.log(`[${new Date().toISOString()}] POST /api/command:`, { ip, port, command });
@@ -221,145 +229,29 @@ app.post('/api/command', async (req, res) => {
 });
 
 // ---------- GPortal API via rce.js (disabled) ----------
-// (commented out as before)
+/*
+// rce.js endpoints removed
+*/
 
-// ---------- Discord OAuth (with improved error logging) ----------
-const DISCORD_CLIENT_ID = '1481899114986733630';
-const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
-const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
-
-app.get('/api/discord/login', (req, res) => {
-    console.log(`[${new Date().toISOString()}] GET /api/discord/login - redirecting to Discord`);
-    const discordAuthUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify`;
-    res.redirect(discordAuthUrl);
-});
-
-app.get('/api/discord/callback', async (req, res) => {
-    const { code } = req.query;
-    console.log(`[${new Date().toISOString()}] GET /api/discord/callback with code: ${code ? 'present' : 'missing'}`);
-    if (!code) {
-        return res.status(400).send('No code provided');
-    }
-
-    const maxRetries = 3;
-    let retryCount = 0;
-    let retryDelay = 1000;
-
-    while (retryCount < maxRetries) {
-        try {
-            const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'User-Agent': 'DrainedTabletBridge/7.0.0',
-                    'Accept': 'application/json'
-                },
-                body: new URLSearchParams({
-                    client_id: DISCORD_CLIENT_ID,
-                    client_secret: DISCORD_CLIENT_SECRET,
-                    grant_type: 'authorization_code',
-                    code,
-                    redirect_uri: REDIRECT_URI
-                })
-            });
-
-            if (tokenResponse.status === 429) {
-                const errorData = await tokenResponse.json();
-                console.error('❌ Discord rate limit details:', errorData);
-                const retryAfter = errorData.retry_after || 30;
-                console.log(`⏳ Rate limited. Waiting ${retryAfter} seconds before retry ${retryCount + 1}/${maxRetries}`);
-                await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-                retryCount++;
-                continue;
-            }
-
-            if (!tokenResponse.ok) {
-                const errorText = await tokenResponse.text();
-                console.error('❌ Discord token error response:', errorText);
-                return res.redirect(`https://the-drained-tablet.vercel.app/?discord=error&details=${encodeURIComponent(errorText.substring(0, 200))}`);
-            }
-
-            const tokenData = await tokenResponse.json();
-            if (!tokenData.access_token) {
-                throw new Error('Failed to get access token');
-            }
-
-            const userResponse = await fetch('https://discord.com/api/users/@me', {
-                headers: {
-                    Authorization: `Bearer ${tokenData.access_token}`,
-                    'User-Agent': 'DrainedTabletBridge/7.0.0'
-                }
-            });
-
-            if (!userResponse.ok) {
-                const errorText = await userResponse.text();
-                console.error('❌ Discord user error response:', errorText);
-                throw new Error('Failed to fetch user data');
-            }
-
-            const userData = await userResponse.json();
-
-            const discordId = userData.id;
-            const username = `discord_${discordId}`;
-            const role = 'user';
-
-            const existing = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-            if (existing.rows.length === 0) {
-                await pool.query(
-                    'INSERT INTO users (username, password_hash, role, discord_id) VALUES ($1, $2, $3, $4)',
-                    [username, '', role, discordId]
-                );
-            }
-
-            console.log('✅ Discord user linked/stored:', userData.username, discordId);
-            return res.redirect(`https://the-drained-tablet.vercel.app/?discord=linked&id=${discordId}`);
-
-        } catch (err) {
-            console.error('❌ Discord OAuth error:', err.message);
-            console.error(err.stack);
-            return res.redirect('https://the-drained-tablet.vercel.app/?discord=error&message=' + encodeURIComponent(err.message));
-        }
-    }
-
-    // If we exhaust retries
-    res.redirect('https://the-drained-tablet.vercel.app/?discord=error&message=Rate%20limited%20after%20multiple%20retries');
-});
+// ---------- Discord OAuth (disabled) ----------
+// Discord endpoints removed
 
 // ---------- User Server Management ----------
 function getUserFromRequest(req) {
-    // First try the old discord_id, then username from query or body
-    const discordId = req.query.discord_id;
-    if (discordId) return discordId;
     const username = req.query.username || req.body.username;
     return username;
 }
 
 app.get('/api/user/servers', async (req, res) => {
-    const identifier = getUserFromRequest(req);
-    if (!identifier) {
+    const username = getUserFromRequest(req);
+    if (!username) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
     try {
-        let user;
-        if (identifier.startsWith('discord_')) {
-            const userRes = await pool.query('SELECT username FROM users WHERE discord_id = $1', [identifier]);
-            if (userRes.rows.length === 0) {
-                return res.status(404).json({ error: 'User not found' });
-            }
-            user = userRes.rows[0].username;
-        } else {
-            user = identifier;
-            // Verify user exists
-            const userRes = await pool.query('SELECT username FROM users WHERE username = $1', [user]);
-            if (userRes.rows.length === 0) {
-                return res.status(404).json({ error: 'User not found' });
-            }
-        }
-
         const result = await pool.query(
             'SELECT id, name, ip, port, server_id, region, created_at FROM user_servers WHERE user_id = $1 ORDER BY created_at DESC',
-            [user]
+            [username]
         );
         res.json(result.rows);
     } catch (err) {
@@ -369,35 +261,26 @@ app.get('/api/user/servers', async (req, res) => {
 });
 
 app.post('/api/user/servers', async (req, res) => {
-    const identifier = getUserFromRequest(req);
-    if (!identifier) {
+    const username = getUserFromRequest(req);
+    if (!username) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
-    const { name, ip, port, password, server_id, region, username } = req.body;
+    const { name, ip, port, password, server_id, region } = req.body;
     if (!name || !ip || !port || !password) {
         return res.status(400).json({ error: 'Missing required fields' });
     }
 
     try {
-        let user;
-        if (identifier.startsWith('discord_')) {
-            const userRes = await pool.query('SELECT username FROM users WHERE discord_id = $1', [identifier]);
-            if (userRes.rows.length === 0) {
-                return res.status(404).json({ error: 'User not found' });
-            }
-            user = userRes.rows[0].username;
-        } else {
-            user = identifier;
-            const userRes = await pool.query('SELECT username FROM users WHERE username = $1', [user]);
-            if (userRes.rows.length === 0) {
-                return res.status(404).json({ error: 'User not found' });
-            }
+        // Verify user exists
+        const userRes = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
         }
 
         const result = await pool.query(
             'INSERT INTO user_servers (user_id, name, ip, port, password, server_id, region) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
-            [user, name, ip, port, password, server_id || null, region || null]
+            [username, name, ip, port, password, server_id || null, region || null]
         );
         res.json({ success: true, id: result.rows[0].id });
     } catch (err) {
@@ -407,29 +290,14 @@ app.post('/api/user/servers', async (req, res) => {
 });
 
 app.delete('/api/user/servers/:id', async (req, res) => {
-    const identifier = getUserFromRequest(req);
-    if (!identifier) {
+    const username = getUserFromRequest(req);
+    if (!username) {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
     const serverId = req.params.id;
     try {
-        let user;
-        if (identifier.startsWith('discord_')) {
-            const userRes = await pool.query('SELECT username FROM users WHERE discord_id = $1', [identifier]);
-            if (userRes.rows.length === 0) {
-                return res.status(404).json({ error: 'User not found' });
-            }
-            user = userRes.rows[0].username;
-        } else {
-            user = identifier;
-            const userRes = await pool.query('SELECT username FROM users WHERE username = $1', [user]);
-            if (userRes.rows.length === 0) {
-                return res.status(404).json({ error: 'User not found' });
-            }
-        }
-
-        await pool.query('DELETE FROM user_servers WHERE id = $1 AND user_id = $2', [serverId, user]);
+        await pool.query('DELETE FROM user_servers WHERE id = $1 AND user_id = $2', [serverId, username]);
         res.json({ success: true });
     } catch (err) {
         console.error('Error deleting server:', err);
@@ -581,6 +449,8 @@ app.post('/api/forgot-code', (req, res) => {
 });
 
 // ==================== SHOP API ====================
+
+// GET all shop items
 app.get('/api/shop/items', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM shop_items ORDER BY category, name');
@@ -591,6 +461,7 @@ app.get('/api/shop/items', async (req, res) => {
     }
 });
 
+// POST a new shop item
 app.post('/api/shop/items', async (req, res) => {
     const { name, description, shortname, price, stock, category, image, command } = req.body;
     try {
@@ -606,6 +477,7 @@ app.post('/api/shop/items', async (req, res) => {
     }
 });
 
+// PUT update an item
 app.put('/api/shop/items/:id', async (req, res) => {
     const { name, description, shortname, price, stock, category, image, command } = req.body;
     try {
@@ -621,6 +493,7 @@ app.put('/api/shop/items/:id', async (req, res) => {
     }
 });
 
+// DELETE an item
 app.delete('/api/shop/items/:id', async (req, res) => {
     try {
         await pool.query('DELETE FROM shop_items WHERE id = $1', [req.params.id]);
@@ -631,6 +504,7 @@ app.delete('/api/shop/items/:id', async (req, res) => {
     }
 });
 
+// POST /api/shop/purchase – creates a claim
 app.post('/api/shop/purchase', async (req, res) => {
     const { playerId, itemShortname, quantity } = req.body;
     try {
