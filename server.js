@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (with user-based server management)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (using TCP RCON for Rust Console)
 
 require('dotenv').config();
 const express = require('express');
@@ -6,7 +6,7 @@ const cors = require('cors');
 const { createServer } = require('http');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
-// const { default: RCEManager, LogLevel } = require('rce.js'); // disabled
+const { Rcon } = require('rcon-client');
 
 const app = express();
 const httpServer = createServer(app);
@@ -127,7 +127,7 @@ async function initDB() {
             END $$;
         `);
         
-        // Ensure the master user exists
+        // Ensure master user exists
         await pool.query(
             `INSERT INTO users (username, password_hash, role, discord_id)
              VALUES ('CooseTheGeek', '', 'master', NULL)
@@ -143,126 +143,39 @@ async function initDB() {
 }
 initDB().catch(console.error);
 
-// ---------- WebRcon Connection Management (fallback) ----------
+// ---------- RCON Connection Management (TCP) ----------
 const connections = new Map();
 
-async function createWebRconConnection(ip, port, password) {
-    const url = `ws://${ip}:${port}/${password}`;
-    console.log(`🔄 Creating WebRcon connection to ${url}`);
-
-    return new Promise((resolve, reject) => {
-        const ws = new WebSocket(url, {
-            handshakeTimeout: 10000,
-            rejectUnauthorized: false
-        });
-
-        let authenticated = false;
-        const pendingCommands = new Map();
-        let authTimeout = setTimeout(() => {
-            if (!authenticated) {
-                ws.close();
-                reject(new Error('Authentication timeout: server did not respond to auth request'));
-            }
-        }, 5000);
-
-        ws.on('open', () => {
-            console.log('✅ WebSocket opened, sending authentication message...');
-            ws.send(JSON.stringify({
-                Identifier: -1,
-                Message: password,
-                Name: "WebRcon"
-            }));
-        });
-
-        ws.on('message', (data) => {
-            try {
-                const response = JSON.parse(data.toString());
-                console.log('📩 WebRcon message:', response);
-
-                if (response.Identifier === -1) {
-                    clearTimeout(authTimeout);
-                    if (response.Message === "Success") {
-                        authenticated = true;
-                        console.log('✅ WebRcon authenticated');
-                        resolve({
-                            send: (command) => sendCommand(ws, command, pendingCommands),
-                            close: () => ws.close()
-                        });
-                    } else {
-                        reject(new Error('Authentication failed: ' + response.Message));
-                    }
-                    return;
-                }
-
-                const pending = pendingCommands.get(response.Identifier);
-                if (pending) {
-                    clearTimeout(pending.timeout);
-                    pending.resolve(response.Message);
-                    pendingCommands.delete(response.Identifier);
-                }
-            } catch (e) {
-                console.error('❌ Failed to parse WebRcon message:', e);
-            }
-        });
-
-        ws.on('error', (err) => {
-            console.error('❌ WebSocket error:', err.message);
-            clearTimeout(authTimeout);
-            reject(err);
-        });
-
-        ws.on('close', () => {
-            console.log('🔌 WebRcon connection closed');
-            clearTimeout(authTimeout);
-            for (const [id, pending] of pendingCommands) {
-                clearTimeout(pending.timeout);
-                pending.reject(new Error('Connection closed'));
-            }
-            pendingCommands.clear();
-        });
-    });
-}
-
-function sendCommand(ws, command, pendingMap) {
-    return new Promise((resolve, reject) => {
-        const id = Date.now() + Math.floor(Math.random() * 1000);
-        const timeout = setTimeout(() => {
-            pendingMap.delete(id);
-            reject(new Error('Command timeout'));
-        }, 10000);
-
-        pendingMap.set(id, { resolve, reject, timeout });
-
-        ws.send(JSON.stringify({
-            Identifier: id,
-            Message: command,
-            Name: "WebRcon"
-        }));
-    });
-}
-
-async function getWebRcon(ip, port, password) {
+async function getRcon(ip, port, password) {
     const key = `${ip}:${port}`;
     let entry = connections.get(key);
-    if (entry && entry.ws && entry.ws.readyState === WebSocket.OPEN) {
-        console.log(`✅ Reusing existing WebRcon connection for ${key}`);
+    if (entry && entry.client && entry.client.socket && !entry.client.socket.destroyed) {
+        console.log(`✅ Reusing existing RCON connection for ${key}`);
         return entry;
     }
 
     if (entry) {
-        entry.close();
+        try {
+            entry.client.end();
+        } catch (e) {}
         connections.delete(key);
     }
 
-    console.log(`🔄 Creating new WebRcon connection for ${key}`);
-    try {
-        const connection = await createWebRconConnection(ip, port, password);
-        connections.set(key, connection);
-        return connection;
-    } catch (err) {
-        connections.delete(key);
-        throw err;
-    }
+    console.log(`🔄 Creating new TCP RCON connection to ${ip}:${port}`);
+    const client = await Rcon.connect({
+        host: ip,
+        port: port,
+        password: password
+    });
+    console.log(`✅ TCP RCON connected to ${ip}:${port}`);
+    const wrapper = {
+        send: async (command) => {
+            return await client.send(command);
+        },
+        close: () => client.end()
+    };
+    connections.set(key, wrapper);
+    return wrapper;
 }
 
 // ---------- API Endpoints ----------
@@ -273,115 +186,148 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', connections: connections.size });
 });
 
-// Connect to server (WebRcon) – kept as fallback
+// Connect to server (TCP RCON)
 app.post('/api/connect', async (req, res) => {
     const { ip, port, password } = req.body;
     console.log(`[${new Date().toISOString()}] POST /api/connect:`, { ip, port, password: '***' });
 
     try {
-        const rcon = await getWebRcon(ip, port, password);
+        const rcon = await getRcon(ip, port, password);
         const result = await rcon.send('status');
         console.log('📨 Test command response (first 200 chars):', result?.substring(0, 200));
         res.json({ success: true, server: { ip, port, password } });
     } catch (err) {
-        console.error('❌ WebRcon connection error:', err.message);
+        console.error('❌ RCON connection error:', err.message);
         console.error(err.stack);
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// Execute RCON command (WebRcon) – kept as fallback
+// Execute RCON command (TCP)
 app.post('/api/command', async (req, res) => {
     const { ip, port, password, command } = req.body;
     console.log(`[${new Date().toISOString()}] POST /api/command:`, { ip, port, command });
 
     try {
-        const rcon = await getWebRcon(ip, port, password);
+        const rcon = await getRcon(ip, port, password);
         const result = await rcon.send(command);
         console.log('📨 Command response (first 200 chars):', result?.substring(0, 200));
         res.json({ success: true, result });
     } catch (err) {
-        console.error('❌ WebRcon command error:', err.message);
+        console.error('❌ RCON command error:', err.message);
         console.error(err.stack);
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
 // ---------- GPortal API via rce.js (disabled) ----------
-/*
-let rce = null;
-let serverIdentifier = null;
+// (commented out as before)
 
-async function initGPortal() {
-    const host = '144.126.137.59';
-    const port = 28916;
-    const password = 'Thatakspray';
+// ---------- Discord OAuth (with improved error logging) ----------
+const DISCORD_CLIENT_ID = '1481899114986733630';
+const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
+const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
 
-    try {
-        console.log('🔐 Initializing rce.js with direct RCON...');
-        
-        rce = new RCEManager({
-            logger: {
-                level: LogLevel.Info
+app.get('/api/discord/login', (req, res) => {
+    console.log(`[${new Date().toISOString()}] GET /api/discord/login - redirecting to Discord`);
+    const discordAuthUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify`;
+    res.redirect(discordAuthUrl);
+});
+
+app.get('/api/discord/callback', async (req, res) => {
+    const { code } = req.query;
+    console.log(`[${new Date().toISOString()}] GET /api/discord/callback with code: ${code ? 'present' : 'missing'}`);
+    if (!code) {
+        return res.status(400).send('No code provided');
+    }
+
+    const maxRetries = 3;
+    let retryCount = 0;
+    let retryDelay = 1000;
+
+    while (retryCount < maxRetries) {
+        try {
+            const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': 'DrainedTabletBridge/7.0.0',
+                    'Accept': 'application/json'
+                },
+                body: new URLSearchParams({
+                    client_id: DISCORD_CLIENT_ID,
+                    client_secret: DISCORD_CLIENT_SECRET,
+                    grant_type: 'authorization_code',
+                    code,
+                    redirect_uri: REDIRECT_URI
+                })
+            });
+
+            if (tokenResponse.status === 429) {
+                const errorData = await tokenResponse.json();
+                console.error('❌ Discord rate limit details:', errorData);
+                const retryAfter = errorData.retry_after || 30;
+                console.log(`⏳ Rate limited. Waiting ${retryAfter} seconds before retry ${retryCount + 1}/${maxRetries}`);
+                await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+                retryCount++;
+                continue;
             }
-        });
 
-        await rce.addServer({
-            identifier: 'main-server',
-            rcon: {
-                host,
-                port,
-                password,
-            },
-            state: [],
-            intents: ['ALL']
-        });
+            if (!tokenResponse.ok) {
+                const errorText = await tokenResponse.text();
+                console.error('❌ Discord token error response:', errorText);
+                return res.redirect(`https://the-drained-tablet.vercel.app/?discord=error&details=${encodeURIComponent(errorText.substring(0, 200))}`);
+            }
 
-        serverIdentifier = 'main-server';
-        console.log('✅ rce.js ready – server added');
-    } catch (err) {
-        console.error('❌ Failed to initialize rce.js:', err.message);
-        console.error(err.stack);
-    }
-}
+            const tokenData = await tokenResponse.json();
+            if (!tokenData.access_token) {
+                throw new Error('Failed to get access token');
+            }
 
-app.post('/api/gportal/command', async (req, res) => {
-    const { command } = req.body;
-    if (!command) {
-        return res.status(400).json({ error: 'Command is required' });
+            const userResponse = await fetch('https://discord.com/api/users/@me', {
+                headers: {
+                    Authorization: `Bearer ${tokenData.access_token}`,
+                    'User-Agent': 'DrainedTabletBridge/7.0.0'
+                }
+            });
+
+            if (!userResponse.ok) {
+                const errorText = await userResponse.text();
+                console.error('❌ Discord user error response:', errorText);
+                throw new Error('Failed to fetch user data');
+            }
+
+            const userData = await userResponse.json();
+
+            const discordId = userData.id;
+            const username = `discord_${discordId}`;
+            const role = 'user';
+
+            const existing = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
+            if (existing.rows.length === 0) {
+                await pool.query(
+                    'INSERT INTO users (username, password_hash, role, discord_id) VALUES ($1, $2, $3, $4)',
+                    [username, '', role, discordId]
+                );
+            }
+
+            console.log('✅ Discord user linked/stored:', userData.username, discordId);
+            return res.redirect(`https://the-drained-tablet.vercel.app/?discord=linked&id=${discordId}`);
+
+        } catch (err) {
+            console.error('❌ Discord OAuth error:', err.message);
+            console.error(err.stack);
+            return res.redirect('https://the-drained-tablet.vercel.app/?discord=error&message=' + encodeURIComponent(err.message));
+        }
     }
-    if (!rce || !serverIdentifier) {
-        return res.status(503).json({ error: 'GPortal API not initialized' });
-    }
-    try {
-        const result = await rce.sendCommand(serverIdentifier, command);
-        res.json({ success: true, result });
-    } catch (err) {
-        console.error('GPortal command error:', err);
-        res.status(500).json({ error: err.message });
-    }
+
+    // If we exhaust retries
+    res.redirect('https://the-drained-tablet.vercel.app/?discord=error&message=Rate%20limited%20after%20multiple%20retries');
 });
-
-app.get('/api/gportal/status', async (req, res) => {
-    if (!rce || !serverIdentifier) {
-        return res.status(503).json({ error: 'GPortal API not initialized' });
-    }
-    try {
-        const info = await rce.fetchInfo(serverIdentifier);
-        res.json(info);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-*/
-// GPortal endpoints disabled to avoid connection errors
-
-// ---------- Discord OAuth (disabled) ----------
-// The routes are left commented to avoid confusion.
 
 // ---------- User Server Management ----------
 function getUserFromRequest(req) {
-    // Try discord_id first (legacy), then username from query or body
+    // First try the old discord_id, then username from query or body
     const discordId = req.query.discord_id;
     if (discordId) return discordId;
     const username = req.query.username || req.body.username;
@@ -404,6 +350,7 @@ app.get('/api/user/servers', async (req, res) => {
             user = userRes.rows[0].username;
         } else {
             user = identifier;
+            // Verify user exists
             const userRes = await pool.query('SELECT username FROM users WHERE username = $1', [user]);
             if (userRes.rows.length === 0) {
                 return res.status(404).json({ error: 'User not found' });
@@ -427,7 +374,7 @@ app.post('/api/user/servers', async (req, res) => {
         return res.status(401).json({ error: 'Not authenticated' });
     }
 
-    const { name, ip, port, password, server_id, region } = req.body;
+    const { name, ip, port, password, server_id, region, username } = req.body;
     if (!name || !ip || !port || !password) {
         return res.status(400).json({ error: 'Missing required fields' });
     }
@@ -634,8 +581,6 @@ app.post('/api/forgot-code', (req, res) => {
 });
 
 // ==================== SHOP API ====================
-
-// GET all shop items
 app.get('/api/shop/items', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM shop_items ORDER BY category, name');
@@ -646,7 +591,6 @@ app.get('/api/shop/items', async (req, res) => {
     }
 });
 
-// POST a new shop item
 app.post('/api/shop/items', async (req, res) => {
     const { name, description, shortname, price, stock, category, image, command } = req.body;
     try {
@@ -662,7 +606,6 @@ app.post('/api/shop/items', async (req, res) => {
     }
 });
 
-// PUT update an item
 app.put('/api/shop/items/:id', async (req, res) => {
     const { name, description, shortname, price, stock, category, image, command } = req.body;
     try {
@@ -678,7 +621,6 @@ app.put('/api/shop/items/:id', async (req, res) => {
     }
 });
 
-// DELETE an item
 app.delete('/api/shop/items/:id', async (req, res) => {
     try {
         await pool.query('DELETE FROM shop_items WHERE id = $1', [req.params.id]);
@@ -689,7 +631,6 @@ app.delete('/api/shop/items/:id', async (req, res) => {
     }
 });
 
-// POST /api/shop/purchase – creates a claim
 app.post('/api/shop/purchase', async (req, res) => {
     const { playerId, itemShortname, quantity } = req.body;
     try {
