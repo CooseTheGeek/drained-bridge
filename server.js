@@ -1,9 +1,9 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full version)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (WebSocket RCON)
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { Rcon } = require('rcon-client');
+const WebSocket = require('ws');
 const { Pool } = require('pg');
 
 const app = express();
@@ -115,37 +115,68 @@ async function initDB() {
 }
 initDB();
 
-// ---------- RCON connection cache (using rcon-client) ----------
-const connections = new Map();
+// ---------- WebSocket RCON connection (the critical fix) ----------
+async function executeRCONCommand(ip, port, password, command) {
+    return new Promise((resolve, reject) => {
+        const url = `ws://${ip}:${port}/${password}`;
+        console.log(`Connecting to ${url}`);
+        const ws = new WebSocket(url);
 
-async function getRconConnection(ip, port, password) {
-    const key = `${ip}:${port}`;
-    if (connections.has(key)) {
-        const conn = connections.get(key);
-        if (conn && !conn.socket?.destroyed) return conn;
-        else connections.delete(key);
-    }
-    const rcon = await Rcon.connect({ host: ip, port, password });
-    connections.set(key, rcon);
-    return rcon;
+        const timeout = setTimeout(() => {
+            ws.close();
+            reject(new Error('RCON connection timeout - check IP, port, password, and ensure WebSocket RCON is enabled'));
+        }, 10000);
+
+        ws.on('open', () => {
+            console.log('WebSocket opened, sending command...');
+            ws.send(JSON.stringify({
+                Identifier: Date.now(),
+                Message: command,
+                Name: "DrainedTablet"
+            }));
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const response = JSON.parse(data.toString());
+                console.log('RCON response:', response);
+                clearTimeout(timeout);
+                ws.close();
+                resolve(response.Message || 'Command executed (no output)');
+            } catch (e) {
+                clearTimeout(timeout);
+                ws.close();
+                reject(new Error('Failed to parse RCON response'));
+            }
+        });
+
+        ws.on('error', (err) => {
+            clearTimeout(timeout);
+            console.error('WebSocket error:', err.message);
+            reject(new Error(`WebSocket error: ${err.message}`));
+        });
+
+        ws.on('close', () => {
+            console.log('WebSocket closed');
+        });
+    });
 }
 
 // ---------- API endpoints ----------
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', connections: connections.size });
+    res.json({ status: 'ok', message: 'Bridge is running' });
 });
 
 app.post('/api/command', async (req, res) => {
     const { ip, port, password, command } = req.body;
     if (!ip || !port || !password || !command) {
-        return res.status(400).json({ success: false, error: 'Missing parameters' });
+        return res.status(400).json({ success: false, error: 'Missing ip, port, password, or command' });
     }
     try {
-        const rcon = await getRconConnection(ip, port, password);
-        const result = await rcon.send(command);
+        const result = await executeRCONCommand(ip, port, password, command);
         res.json({ success: true, result });
     } catch (err) {
-        console.error('RCON error:', err.message);
+        console.error('RCON command error:', err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 });
@@ -196,14 +227,14 @@ app.get('/api/discord/callback', async (req, res) => {
     }
 });
 
-// User server management (for Discord-linked users)
+// User server management (for Discord‑linked users)
 app.get('/api/user/servers', async (req, res) => {
     const discordId = req.query.discord_id;
     if (!discordId) return res.status(401).json({ error: 'Not authenticated' });
     try {
         const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
         if (user.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-        const result = await pool.query('SELECT id, name, ip, port, server_id, region FROM user_servers WHERE user_id = $1', [user.rows[0].username]);
+        const result = await pool.query('SELECT id, name, ip, port, server_id, region, created_at FROM user_servers WHERE user_id = $1 ORDER BY created_at DESC', [user.rows[0].username]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -214,7 +245,7 @@ app.post('/api/user/servers', async (req, res) => {
     const discordId = req.query.discord_id;
     if (!discordId) return res.status(401).json({ error: 'Not authenticated' });
     const { name, ip, port, password, server_id, region } = req.body;
-    if (!name || !ip || !port || !password) return res.status(400).json({ error: 'Missing fields' });
+    if (!name || !ip || !port || !password) return res.status(400).json({ error: 'Missing required fields' });
     try {
         const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
         if (user.rows.length === 0) return res.status(404).json({ error: 'User not found' });
@@ -369,7 +400,7 @@ app.post('/api/drained/purchase', async (req, res) => {
 
 app.post('/api/drained/deploy', async (req, res) => {
     const { playerId, blueprintId } = req.body;
-    if (!playerId || !blueprintId) return res.status(400).json({ error: 'Missing fields' });
+    if (!playerId || !blueprintId) return res.status(400).json({ error: 'Missing playerId or blueprintId' });
     try {
         await pool.query('UPDATE drained_purchases SET deployed_at = NOW() WHERE player_id = $1 AND blueprint_id = $2 AND deployed_at IS NULL', [playerId, blueprintId]);
         res.json({ success: true });
@@ -390,7 +421,7 @@ app.get('/api/shop/items', async (req, res) => {
 
 app.post('/api/shop/purchase', async (req, res) => {
     const { playerId, itemShortname, quantity } = req.body;
-    if (!playerId || !itemShortname) return res.status(400).json({ error: 'Missing fields' });
+    if (!playerId || !itemShortname) return res.status(400).json({ error: 'Missing playerId or itemShortname' });
     try {
         await pool.query('INSERT INTO claims (player_id, item_shortname, quantity) VALUES ($1, $2, $3)', [playerId, itemShortname, quantity]);
         res.json({ success: true });
