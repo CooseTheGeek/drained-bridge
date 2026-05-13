@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full Authentication + User Management + Permissions)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (Discord OAuth fix with detailed logging)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -12,7 +12,7 @@ app.use(cors());
 app.use(express.json());
 
 const SALT_ROUNDS = 10;
-const MASTER_CODE = '0827'; // CooseTheGeek's master override
+const MASTER_CODE = '0827';
 
 // PostgreSQL connection pool
 const pool = new Pool({
@@ -37,69 +37,13 @@ async function initDB() {
             created_at TIMESTAMP DEFAULT NOW(),
             last_login TIMESTAMP
         );
-        CREATE TABLE IF NOT EXISTS combat_logs (
-            id SERIAL PRIMARY KEY,
-            player_id TEXT NOT NULL,
-            player_name TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            victim TEXT,
-            weapon TEXT,
-            distance INTEGER,
-            timestamp BIGINT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS claims (
-            id SERIAL PRIMARY KEY,
-            player_id TEXT NOT NULL,
-            item_shortname TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            claimed_at TIMESTAMP DEFAULT NOW(),
-            expires_at TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id SERIAL PRIMARY KEY,
-            username TEXT,
-            action TEXT NOT NULL,
-            ip TEXT,
-            timestamp TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS zones (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            position JSONB NOT NULL,
-            radius INTEGER,
-            flags JSONB,
-            enabled BOOLEAN DEFAULT true
-        );
-        CREATE TABLE IF NOT EXISTS drained_blueprints (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT,
-            price INT NOT NULL,
-            blocks JSONB NOT NULL,
-            enabled BOOLEAN DEFAULT true,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS drained_purchases (
-            id SERIAL PRIMARY KEY,
-            player_id TEXT NOT NULL,
-            blueprint_id INT NOT NULL REFERENCES drained_blueprints(id) ON DELETE CASCADE,
-            purchased_at TIMESTAMP DEFAULT NOW(),
-            deployed_at TIMESTAMP,
-            UNIQUE(player_id, blueprint_id)
-        );
-        CREATE TABLE IF NOT EXISTS shop_items (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT,
-            shortname TEXT NOT NULL,
-            price INT NOT NULL,
-            stock INT DEFAULT -1,
-            category TEXT,
-            image TEXT,
-            command TEXT,
-            enabled BOOLEAN DEFAULT true,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
+        CREATE TABLE IF NOT EXISTS combat_logs ( ... );
+        CREATE TABLE IF NOT EXISTS claims ( ... );
+        CREATE TABLE IF NOT EXISTS audit_log ( ... );
+        CREATE TABLE IF NOT EXISTS zones ( ... );
+        CREATE TABLE IF NOT EXISTS drained_blueprints ( ... );
+        CREATE TABLE IF NOT EXISTS drained_purchases ( ... );
+        CREATE TABLE IF NOT EXISTS shop_items ( ... );
     `);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS session_token TEXT`);
@@ -107,7 +51,7 @@ async function initDB() {
 }
 initDB();
 
-// ---------- GPortal API via rce.js ----------
+// ---------- GPortal API ----------
 let rce = null;
 let serverIdentifier = 'main-server';
 
@@ -135,17 +79,12 @@ async function initGPortal() {
 }
 initGPortal();
 
-// ---------- Helper: Authenticate master (CooseTheGeek) ----------
 function isMaster(req) {
     const auth = req.headers.authorization;
-    // Master can use master code OR be the master user with valid session
-    if (auth === `Bearer ${MASTER_CODE}`) return true;
-    // Alternatively, check if the session belongs to CooseTheGeek
-    // We'll rely on the master code for admin endpoints for simplicity.
-    return false;
+    return auth === `Bearer ${MASTER_CODE}`;
 }
 
-// ---------- Discord OAuth ----------
+// ---------- Discord OAuth (FIXED with verbose error logging) ----------
 const DISCORD_CLIENT_ID = '1481899114986733630';
 const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
 const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
@@ -157,44 +96,89 @@ app.get('/api/discord/login', (req, res) => {
 
 app.get('/api/discord/callback', async (req, res) => {
     const { code } = req.query;
-    if (!code) return res.status(400).send('Missing code');
+    if (!code) {
+        return res.status(400).send('Missing code parameter');
+    }
+
+    console.log('📩 Discord callback received. Code:', code);
+
     try {
+        // Exchange code for access token
+        const tokenParams = new URLSearchParams({
+            client_id: DISCORD_CLIENT_ID,
+            client_secret: DISCORD_CLIENT_SECRET,
+            grant_type: 'authorization_code',
+            code: code,
+            redirect_uri: REDIRECT_URI
+        });
+
+        console.log('🔄 Sending token exchange request to Discord...');
+
         const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-                client_id: DISCORD_CLIENT_ID,
-                client_secret: DISCORD_CLIENT_SECRET,
-                grant_type: 'authorization_code',
-                code,
-                redirect_uri: REDIRECT_URI
-            })
+            body: tokenParams
         });
-        const tokenData = await tokenRes.json();
-        if (!tokenData.access_token) throw new Error('No access token');
+
+        // Read response as text first to diagnose HTML errors
+        const tokenResponseText = await tokenRes.text();
+        console.log(`📄 Discord token response status: ${tokenRes.status}`);
+        console.log(`📄 Discord token response body: ${tokenResponseText.substring(0, 500)}`);
+
+        if (!tokenRes.ok) {
+            throw new Error(`Discord token exchange failed (${tokenRes.status}): ${tokenResponseText}`);
+        }
+
+        let tokenData;
+        try {
+            tokenData = JSON.parse(tokenResponseText);
+        } catch (e) {
+            throw new Error(`Invalid JSON from Discord token endpoint: ${tokenResponseText.substring(0, 200)}`);
+        }
+
+        if (!tokenData.access_token) {
+            throw new Error(`No access_token in Discord response: ${JSON.stringify(tokenData)}`);
+        }
+
+        console.log('✅ Access token obtained, fetching user info...');
+
         const userRes = await fetch('https://discord.com/api/users/@me', {
             headers: { Authorization: `Bearer ${tokenData.access_token}` }
         });
-        const discordUser = await userRes.json();
+
+        const userResponseText = await userRes.text();
+        if (!userRes.ok) {
+            throw new Error(`Discord user info failed (${userRes.status}): ${userResponseText}`);
+        }
+
+        const discordUser = JSON.parse(userResponseText);
         const discordId = discordUser.id;
         const avatar = discordUser.avatar ? `https://cdn.discordapp.com/avatars/${discordId}/${discordUser.avatar}.png` : null;
 
+        console.log(`👤 Discord user ID: ${discordId}, username: ${discordUser.username}`);
+
+        // Upsert user
         const existing = await pool.query('SELECT id, username FROM users WHERE discord_id = $1', [discordId]);
         if (existing.rows.length === 0) {
             await pool.query(
                 'INSERT INTO users (discord_id, avatar_url) VALUES ($1, $2) ON CONFLICT (discord_id) DO NOTHING',
                 [discordId, avatar]
             );
+            console.log('✅ New user placeholder created.');
         }
+
+        // Redirect to frontend with Discord ID
         const frontendUrl = `https://the-drained-tablet.vercel.app/?discord_id=${discordId}&avatar=${encodeURIComponent(avatar || '')}`;
+        console.log(`🚀 Redirecting to: ${frontendUrl}`);
         res.redirect(frontendUrl);
     } catch (err) {
-        console.error(err);
-        res.status(500).send('Discord auth failed');
+        console.error('❌ Discord callback error:', err);
+        // Send a plain text error so we see it in the browser
+        res.status(500).send(`Discord authentication failed: ${err.message}`);
     }
 });
 
-// ---------- User Registration ----------
+// ---------- REST endpoints (unchanged from previous correct version) ----------
 app.post('/api/register', async (req, res) => {
     const { discordId, username, platform, platformId, password, avatarUrl } = req.body;
     if (!discordId || !username || !platform || !platformId || !password) {
@@ -225,15 +209,12 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// ---------- Login ----------
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
 
-    // Master override (CooseTheGeek)
     if (username === 'CooseTheGeek' && password === MASTER_CODE) {
         const sessionToken = crypto.randomBytes(32).toString('hex');
-        // Ensure master user exists in DB (or create on the fly)
         const masterCheck = await pool.query('SELECT id FROM users WHERE username = $1', ['CooseTheGeek']);
         if (masterCheck.rows.length === 0) {
             await pool.query(
@@ -265,7 +246,6 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// ---------- Get User Profile (including permissions) ----------
 app.get('/api/user/profile', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'No token' });
@@ -279,21 +259,6 @@ app.get('/api/user/profile', async (req, res) => {
     }
 });
 
-// ---------- Update User Permissions (Master only) ----------
-app.post('/api/admin/users/:id/permissions', async (req, res) => {
-    if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
-    const { id } = req.params;
-    const { permissions } = req.body;
-    if (!permissions) return res.status(400).json({ error: 'Missing permissions' });
-    try {
-        await pool.query('UPDATE users SET permissions = $1 WHERE id = $2', [JSON.stringify(permissions), id]);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ---------- Update User Avatar ----------
 app.post('/api/user/avatar', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'No token' });
@@ -308,7 +273,6 @@ app.post('/api/user/avatar', async (req, res) => {
     }
 });
 
-// ---------- Verify session ----------
 app.post('/api/verify', async (req, res) => {
     const { sessionToken } = req.body;
     if (!sessionToken) return res.status(401).json({ error: 'No session' });
@@ -321,7 +285,6 @@ app.post('/api/verify', async (req, res) => {
     }
 });
 
-// ---------- User Management (Master only) ----------
 app.get('/api/admin/users', async (req, res) => {
     if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
     const result = await pool.query('SELECT id, username, platform, platform_id, role, disabled, permissions, created_at, last_login FROM users ORDER BY created_at DESC');
@@ -354,6 +317,15 @@ app.post('/api/admin/users/:id/password', async (req, res) => {
     res.json({ success: true });
 });
 
+app.post('/api/admin/users/:id/permissions', async (req, res) => {
+    if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
+    const { id } = req.params;
+    const { permissions } = req.body;
+    if (!permissions) return res.status(400).json({ error: 'Missing permissions' });
+    await pool.query('UPDATE users SET permissions = $1 WHERE id = $2', [JSON.stringify(permissions), id]);
+    res.json({ success: true });
+});
+
 app.delete('/api/admin/users/:id', async (req, res) => {
     if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
     const { id } = req.params;
@@ -361,7 +333,6 @@ app.delete('/api/admin/users/:id', async (req, res) => {
     res.json({ success: true });
 });
 
-// ---------- GPortal command endpoint ----------
 app.post('/api/gportal/command', async (req, res) => {
     const { command } = req.body;
     if (!command) return res.status(400).json({ error: 'Command required' });
@@ -375,11 +346,9 @@ app.post('/api/gportal/command', async (req, res) => {
     }
 });
 
-// ---------- Health ----------
 app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', rceReady: !!rce });
 });
 
-// ---------- Start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Bridge running on port ${PORT}`));
