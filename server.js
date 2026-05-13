@@ -1,14 +1,18 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full, with GPortal API via rce.js)
-
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full Authentication + User Management + Permissions)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const { default: RCEManager, LogLevel } = require('rce.js');
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const SALT_ROUNDS = 10;
+const MASTER_CODE = '0827'; // CooseTheGeek's master override
 
 // PostgreSQL connection pool
 const pool = new Pool({
@@ -16,106 +20,94 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// ---------- Database initialization ----------
 async function initDB() {
-    try {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS combat_logs (
-                id SERIAL PRIMARY KEY,
-                player_id TEXT NOT NULL,
-                player_name TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                victim TEXT,
-                weapon TEXT,
-                distance INTEGER,
-                timestamp BIGINT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS users (
-                username TEXT PRIMARY KEY,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL,
-                totp_secret TEXT,
-                discord_id TEXT,
-                trusted_devices TEXT[],
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-            CREATE TABLE IF NOT EXISTS claims (
-                id SERIAL PRIMARY KEY,
-                player_id TEXT NOT NULL,
-                item_shortname TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                claimed_at TIMESTAMP DEFAULT NOW(),
-                expires_at TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id SERIAL PRIMARY KEY,
-                username TEXT,
-                action TEXT NOT NULL,
-                ip TEXT,
-                timestamp TIMESTAMP DEFAULT NOW()
-            );
-            CREATE TABLE IF NOT EXISTS zones (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                position JSONB NOT NULL,
-                radius INTEGER,
-                flags JSONB,
-                enabled BOOLEAN DEFAULT true
-            );
-            CREATE TABLE IF NOT EXISTS backup_settings (
-                id TEXT PRIMARY KEY DEFAULT 'default',
-                settings JSONB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS user_servers (
-                id SERIAL PRIMARY KEY,
-                user_id TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                ip TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                password TEXT NOT NULL,
-                server_id TEXT,
-                region TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-            CREATE TABLE IF NOT EXISTS drained_blueprints (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                price INT NOT NULL,
-                blocks JSONB NOT NULL,
-                enabled BOOLEAN DEFAULT true,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-            CREATE TABLE IF NOT EXISTS drained_purchases (
-                id SERIAL PRIMARY KEY,
-                player_id TEXT NOT NULL,
-                blueprint_id INT NOT NULL REFERENCES drained_blueprints(id) ON DELETE CASCADE,
-                purchased_at TIMESTAMP DEFAULT NOW(),
-                deployed_at TIMESTAMP,
-                UNIQUE(player_id, blueprint_id)
-            );
-            CREATE TABLE IF NOT EXISTS shop_items (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                shortname TEXT NOT NULL,
-                price INT NOT NULL,
-                stock INT DEFAULT -1,
-                category TEXT,
-                image TEXT,
-                command TEXT,
-                enabled BOOLEAN DEFAULT true,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-        `);
-        console.log('✅ Database tables ready');
-    } catch (err) {
-        console.error('Database init error:', err.message);
-    }
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            discord_id TEXT UNIQUE,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            platform TEXT,
+            platform_id TEXT,
+            avatar_url TEXT,
+            role TEXT DEFAULT 'user',
+            disabled BOOLEAN DEFAULT FALSE,
+            session_token TEXT,
+            permissions JSONB DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT NOW(),
+            last_login TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS combat_logs (
+            id SERIAL PRIMARY KEY,
+            player_id TEXT NOT NULL,
+            player_name TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            victim TEXT,
+            weapon TEXT,
+            distance INTEGER,
+            timestamp BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS claims (
+            id SERIAL PRIMARY KEY,
+            player_id TEXT NOT NULL,
+            item_shortname TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            claimed_at TIMESTAMP DEFAULT NOW(),
+            expires_at TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id SERIAL PRIMARY KEY,
+            username TEXT,
+            action TEXT NOT NULL,
+            ip TEXT,
+            timestamp TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS zones (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            position JSONB NOT NULL,
+            radius INTEGER,
+            flags JSONB,
+            enabled BOOLEAN DEFAULT true
+        );
+        CREATE TABLE IF NOT EXISTS drained_blueprints (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            price INT NOT NULL,
+            blocks JSONB NOT NULL,
+            enabled BOOLEAN DEFAULT true,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS drained_purchases (
+            id SERIAL PRIMARY KEY,
+            player_id TEXT NOT NULL,
+            blueprint_id INT NOT NULL REFERENCES drained_blueprints(id) ON DELETE CASCADE,
+            purchased_at TIMESTAMP DEFAULT NOW(),
+            deployed_at TIMESTAMP,
+            UNIQUE(player_id, blueprint_id)
+        );
+        CREATE TABLE IF NOT EXISTS shop_items (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            shortname TEXT NOT NULL,
+            price INT NOT NULL,
+            stock INT DEFAULT -1,
+            category TEXT,
+            image TEXT,
+            command TEXT,
+            enabled BOOLEAN DEFAULT true,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS session_token TEXT`);
+    console.log('✅ Database ready');
 }
 initDB();
 
-// ---------- GPortal API via rce.js (the fix) ----------
+// ---------- GPortal API via rce.js ----------
 let rce = null;
 let serverIdentifier = 'main-server';
 
@@ -125,9 +117,7 @@ async function initGPortal() {
     const password = process.env.GPORTAL_RCON_PASSWORD || 'Myakspray1215!';
     const serverId = process.env.GPORTAL_SERVER_ID || '1879409';
     const region = process.env.GPORTAL_REGION || 'US';
-
     try {
-        console.log(`🔐 Initializing rce.js with Server ID: ${serverId}, Region: ${region}`);
         rce = new RCEManager({ logger: { level: LogLevel.Info } });
         await rce.addServer({
             identifier: serverIdentifier,
@@ -138,56 +128,31 @@ async function initGPortal() {
             state: [],
             playerRefreshing: true
         });
-        console.log('✅ rce.js ready – server added');
+        console.log('✅ rce.js ready');
     } catch (err) {
-        console.error('❌ Failed to initialize rce.js:', err.message);
+        console.error('❌ GPortal init failed:', err.message);
     }
 }
 initGPortal();
 
-// ---------- API endpoints ----------
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', rceReady: !!rce });
-});
+// ---------- Helper: Authenticate master (CooseTheGeek) ----------
+function isMaster(req) {
+    const auth = req.headers.authorization;
+    // Master can use master code OR be the master user with valid session
+    if (auth === `Bearer ${MASTER_CODE}`) return true;
+    // Alternatively, check if the session belongs to CooseTheGeek
+    // We'll rely on the master code for admin endpoints for simplicity.
+    return false;
+}
 
-app.post('/api/gportal/command', async (req, res) => {
-    const { command } = req.body;
-    if (!command) return res.status(400).json({ error: 'Command required' });
-    if (!rce || !serverIdentifier) return res.status(503).json({ error: 'GPortal API not ready' });
-    try {
-        const result = await rce.sendCommand(serverIdentifier, command);
-        res.json({ success: true, result });
-    } catch (err) {
-        console.error('GPortal command error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Legacy RCON endpoint (fallback – kept for compatibility)
-app.post('/api/command', async (req, res) => {
-    const { ip, port, password, command } = req.body;
-    if (!ip || !port || !password || !command) {
-        return res.status(400).json({ success: false, error: 'Missing parameters' });
-    }
-    try {
-        if (rce && serverIdentifier) {
-            const result = await rce.sendCommand(serverIdentifier, command);
-            return res.json({ success: true, result });
-        }
-        throw new Error('No active RCON connection');
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// Discord OAuth
+// ---------- Discord OAuth ----------
 const DISCORD_CLIENT_ID = '1481899114986733630';
 const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
 const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
 
 app.get('/api/discord/login', (req, res) => {
-    const discordAuthUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify`;
-    res.redirect(discordAuthUrl);
+    const url = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify`;
+    res.redirect(url);
 });
 
 app.get('/api/discord/callback', async (req, res) => {
@@ -196,11 +161,7 @@ app.get('/api/discord/callback', async (req, res) => {
     try {
         const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': 'DrainedTabletBridge/1.0',
-                'Accept': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({
                 client_id: DISCORD_CLIENT_ID,
                 client_secret: DISCORD_CLIENT_SECRET,
@@ -209,269 +170,216 @@ app.get('/api/discord/callback', async (req, res) => {
                 redirect_uri: REDIRECT_URI
             })
         });
-        if (tokenRes.status === 429) {
-            await new Promise(r => setTimeout(r, 1000));
-            return res.redirect(`/api/discord/callback?code=${code}`);
-        }
         const tokenData = await tokenRes.json();
         if (!tokenData.access_token) throw new Error('No access token');
         const userRes = await fetch('https://discord.com/api/users/@me', {
             headers: { Authorization: `Bearer ${tokenData.access_token}` }
         });
-        const userData = await userRes.json();
-        const discordId = userData.id;
-        const existing = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
+        const discordUser = await userRes.json();
+        const discordId = discordUser.id;
+        const avatar = discordUser.avatar ? `https://cdn.discordapp.com/avatars/${discordId}/${discordUser.avatar}.png` : null;
+
+        const existing = await pool.query('SELECT id, username FROM users WHERE discord_id = $1', [discordId]);
         if (existing.rows.length === 0) {
             await pool.query(
-                'INSERT INTO users (username, password_hash, role, discord_id) VALUES ($1, $2, $3, $4)',
-                [`discord_${discordId}`, '', 'user', discordId]
+                'INSERT INTO users (discord_id, avatar_url) VALUES ($1, $2) ON CONFLICT (discord_id) DO NOTHING',
+                [discordId, avatar]
             );
         }
-        res.redirect(`https://the-drained-tablet.vercel.app/?discord=linked&id=${discordId}`);
+        const frontendUrl = `https://the-drained-tablet.vercel.app/?discord_id=${discordId}&avatar=${encodeURIComponent(avatar || '')}`;
+        res.redirect(frontendUrl);
     } catch (err) {
         console.error(err);
         res.status(500).send('Discord auth failed');
     }
 });
 
-// ---------- User Server Management ----------
-app.get('/api/user/servers', async (req, res) => {
-    const discordId = req.query.discord_id;
-    if (!discordId) return res.status(401).json({ error: 'Not authenticated' });
-    try {
-        const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-        if (user.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-        const result = await pool.query('SELECT id, name, ip, port, server_id, region, created_at FROM user_servers WHERE user_id = $1 ORDER BY created_at DESC', [user.rows[0].username]);
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+// ---------- User Registration ----------
+app.post('/api/register', async (req, res) => {
+    const { discordId, username, platform, platformId, password, avatarUrl } = req.body;
+    if (!discordId || !username || !platform || !platformId || !password) {
+        return res.status(400).json({ error: 'Missing fields' });
     }
-});
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
-app.post('/api/user/servers', async (req, res) => {
-    const discordId = req.query.discord_id;
-    if (!discordId) return res.status(401).json({ error: 'Not authenticated' });
-    const { name, ip, port, password, server_id, region } = req.body;
-    if (!name || !ip || !port || !password) return res.status(400).json({ error: 'Missing fields' });
     try {
-        const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-        if (user.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-        await pool.query(
-            'INSERT INTO user_servers (user_id, name, ip, port, password, server_id, region) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-            [user.rows[0].username, name, ip, port, password, server_id || null, region || null]
+        const existing = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+        if (existing.rows.length > 0) return res.status(409).json({ error: 'Username already taken' });
+
+        const hash = await bcrypt.hash(password, SALT_ROUNDS);
+        const result = await pool.query(
+            `UPDATE users 
+             SET username = $1, password_hash = $2, platform = $3, platform_id = $4, avatar_url = COALESCE($5, avatar_url), role = 'user', disabled = FALSE, last_login = NOW(), permissions = '{}'
+             WHERE discord_id = $6
+             RETURNING id, username, role`,
+            [username, hash, platform, platformId, avatarUrl, discordId]
         );
-        res.json({ success: true });
+        if (result.rows.length === 0) throw new Error('User not found');
+        const user = result.rows[0];
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        await pool.query('UPDATE users SET session_token = $1 WHERE id = $2', [sessionToken, user.id]);
+        res.json({ success: true, username: user.username, role: user.role, sessionToken });
     } catch (err) {
+        console.error(err);
         res.status(500).json({ error: err.message });
     }
 });
 
-app.delete('/api/user/servers/:id', async (req, res) => {
-    const discordId = req.query.discord_id;
-    if (!discordId) return res.status(401).json({ error: 'Not authenticated' });
-    try {
-        const user = await pool.query('SELECT username FROM users WHERE discord_id = $1', [discordId]);
-        if (user.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-        await pool.query('DELETE FROM user_servers WHERE id = $1 AND user_id = $2', [req.params.id, user.rows[0].username]);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
+// ---------- Login ----------
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
 
-// ---------- Combat Logs ----------
-app.post('/api/combatlog', async (req, res) => {
-    const { playerId, playerName, eventType, victim, weapon, distance, timestamp } = req.body;
+    // Master override (CooseTheGeek)
+    if (username === 'CooseTheGeek' && password === MASTER_CODE) {
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        // Ensure master user exists in DB (or create on the fly)
+        const masterCheck = await pool.query('SELECT id FROM users WHERE username = $1', ['CooseTheGeek']);
+        if (masterCheck.rows.length === 0) {
+            await pool.query(
+                'INSERT INTO users (username, role, permissions) VALUES ($1, $2, $3)',
+                ['CooseTheGeek', 'master', '{"*": true}']
+            );
+        } else {
+            await pool.query('UPDATE users SET role = $1, permissions = $2 WHERE username = $3', ['master', '{"*": true}', 'CooseTheGeek']);
+        }
+        await pool.query('UPDATE users SET session_token = $1 WHERE username = $2', [sessionToken, 'CooseTheGeek']);
+        return res.json({ success: true, username: 'CooseTheGeek', role: 'master', sessionToken });
+    }
+
     try {
-        await pool.query(
-            'INSERT INTO combat_logs (player_id, player_name, event_type, victim, weapon, distance, timestamp) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-            [playerId, playerName, eventType, victim, weapon, distance, timestamp]
+        const result = await pool.query(
+            'SELECT id, username, password_hash, role, disabled, permissions FROM users WHERE username = $1',
+            [username]
         );
+        if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+        const user = result.rows[0];
+        if (user.disabled) return res.status(403).json({ error: 'Account disabled' });
+        const match = await bcrypt.compare(password, user.password_hash);
+        if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        await pool.query('UPDATE users SET session_token = $1, last_login = NOW() WHERE id = $2', [sessionToken, user.id]);
+        res.json({ success: true, username: user.username, role: user.role, sessionToken, permissions: user.permissions });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ---------- Get User Profile (including permissions) ----------
+app.get('/api/user/profile', async (req, res) => {
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'No token' });
+    const token = auth.slice(7);
+    try {
+        const result = await pool.query('SELECT username, platform, platform_id, avatar_url, role, permissions FROM users WHERE session_token = $1', [token]);
+        if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid session' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ---------- Update User Permissions (Master only) ----------
+app.post('/api/admin/users/:id/permissions', async (req, res) => {
+    if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
+    const { id } = req.params;
+    const { permissions } = req.body;
+    if (!permissions) return res.status(400).json({ error: 'Missing permissions' });
+    try {
+        await pool.query('UPDATE users SET permissions = $1 WHERE id = $2', [JSON.stringify(permissions), id]);
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-app.get('/api/combatlog/:playerId', async (req, res) => {
+// ---------- Update User Avatar ----------
+app.post('/api/user/avatar', async (req, res) => {
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'No token' });
+    const token = auth.slice(7);
+    const { avatarUrl } = req.body;
+    if (!avatarUrl) return res.status(400).json({ error: 'Missing avatarUrl' });
     try {
-        const result = await pool.query('SELECT * FROM combat_logs WHERE player_id = $1 ORDER BY timestamp DESC LIMIT 100', [req.params.playerId]);
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ---------- Claims ----------
-app.post('/api/claim', async (req, res) => {
-    const { playerId, itemShortname, quantity, expiresAt } = req.body;
-    try {
-        await pool.query('INSERT INTO claims (player_id, item_shortname, quantity, expires_at) VALUES ($1,$2,$3,$4)', [playerId, itemShortname, quantity, expiresAt]);
+        await pool.query('UPDATE users SET avatar_url = $1 WHERE session_token = $2', [avatarUrl, token]);
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-app.get('/api/claims/:playerId', async (req, res) => {
+// ---------- Verify session ----------
+app.post('/api/verify', async (req, res) => {
+    const { sessionToken } = req.body;
+    if (!sessionToken) return res.status(401).json({ error: 'No session' });
     try {
-        const result = await pool.query('SELECT * FROM claims WHERE player_id = $1 AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY claimed_at DESC', [req.params.playerId]);
-        res.json(result.rows);
+        const result = await pool.query('SELECT username, role FROM users WHERE session_token = $1', [sessionToken]);
+        if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid session' });
+        res.json({ valid: true, username: result.rows[0].username, role: result.rows[0].role });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// ---------- Zones ----------
-app.get('/api/zones', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT * FROM zones');
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+// ---------- User Management (Master only) ----------
+app.get('/api/admin/users', async (req, res) => {
+    if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
+    const result = await pool.query('SELECT id, username, platform, platform_id, role, disabled, permissions, created_at, last_login FROM users ORDER BY created_at DESC');
+    res.json(result.rows);
 });
 
-app.post('/api/zones', async (req, res) => {
-    const { id, name, position, radius, flags, enabled } = req.body;
-    try {
-        await pool.query(
-            'INSERT INTO zones (id, name, position, radius, flags, enabled) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET name=$2, position=$3, radius=$4, flags=$5, enabled=$6',
-            [id, name, JSON.stringify(position), radius, JSON.stringify(flags), enabled]
-        );
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.delete('/api/zones/:id', async (req, res) => {
-    try {
-        await pool.query('DELETE FROM zones WHERE id = $1', [req.params.id]);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ---------- Backup Settings ----------
-app.get('/api/backup-settings', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT settings FROM backup_settings WHERE id = $1', ['default']);
-        if (result.rows.length === 0) res.json({ autoBackup: true, interval: 24, keepLast: 30, compress: true, notifyOnComplete: true });
-        else res.json(result.rows[0].settings);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/api/backup-settings', async (req, res) => {
-    try {
-        await pool.query('INSERT INTO backup_settings (id, settings) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET settings = $2', ['default', JSON.stringify(req.body)]);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ---------- Drained Bases Blueprints ----------
-app.get('/api/drained/blueprints', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT * FROM drained_blueprints WHERE enabled = true ORDER BY price ASC');
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/api/drained/purchases/:playerId', async (req, res) => {
-    const { playerId } = req.params;
-    try {
-        const result = await pool.query('SELECT * FROM drained_purchases WHERE player_id = $1 ORDER BY purchased_at DESC', [playerId]);
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/api/drained/purchase', async (req, res) => {
-    const { playerId, blueprintId, price } = req.body;
-    if (!playerId || !blueprintId) return res.status(400).json({ error: 'Missing playerId or blueprintId' });
-    try {
-        await pool.query('INSERT INTO drained_purchases (player_id, blueprint_id) VALUES ($1, $2)', [playerId, blueprintId]);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/api/drained/deploy', async (req, res) => {
-    const { playerId, blueprintId } = req.body;
-    if (!playerId || !blueprintId) return res.status(400).json({ error: 'Missing fields' });
-    try {
-        await pool.query('UPDATE drained_purchases SET deployed_at = NOW() WHERE player_id = $1 AND blueprint_id = $2 AND deployed_at IS NULL', [playerId, blueprintId]);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ---------- Shop ----------
-app.get('/api/shop/items', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT * FROM shop_items WHERE enabled = true ORDER BY price ASC');
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.post('/api/shop/purchase', async (req, res) => {
-    const { playerId, itemShortname, quantity } = req.body;
-    if (!playerId || !itemShortname) return res.status(400).json({ error: 'Missing fields' });
-    try {
-        await pool.query('INSERT INTO claims (player_id, item_shortname, quantity) VALUES ($1, $2, $3)', [playerId, itemShortname, quantity]);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ---------- GPortal Quick Connect ----------
-app.post('/api/gportal/resolve', (req, res) => {
-    const { code } = req.body;
-    if (code === 'F7K2M9') res.json({ ip: '144.126.137.59', port: 28916, password: 'Myakspray1215' });
-    else res.status(404).json({ error: 'Code not found' });
-});
-
-// ---------- Forgot Code ----------
-app.post('/api/forgot-code', (req, res) => {
+app.post('/api/admin/users/:id/disable', async (req, res) => {
+    if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
+    const { id } = req.params;
+    await pool.query('UPDATE users SET disabled = NOT disabled WHERE id = $1', [id]);
     res.json({ success: true });
 });
 
-// ---------- Audit Log ----------
-app.post('/api/audit', async (req, res) => {
-    const { username, action, ip } = req.body;
+app.post('/api/admin/users/:id/role', async (req, res) => {
+    if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
+    const { id } = req.params;
+    const { role } = req.body;
+    if (!['user', 'owner', 'master'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
+    await pool.query('UPDATE users SET role = $1 WHERE id = $2', [role, id]);
+    res.json({ success: true });
+});
+
+app.post('/api/admin/users/:id/password', async (req, res) => {
+    if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
+    const { id } = req.params;
+    const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Password too short' });
+    const hash = await bcrypt.hash(newPassword, SALT_ROUNDS);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, id]);
+    res.json({ success: true });
+});
+
+app.delete('/api/admin/users/:id', async (req, res) => {
+    if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
+    const { id } = req.params;
+    await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    res.json({ success: true });
+});
+
+// ---------- GPortal command endpoint ----------
+app.post('/api/gportal/command', async (req, res) => {
+    const { command } = req.body;
+    if (!command) return res.status(400).json({ error: 'Command required' });
+    if (!rce || !serverIdentifier) return res.status(503).json({ error: 'GPortal not ready' });
     try {
-        await pool.query('INSERT INTO audit_log (username, action, ip) VALUES ($1, $2, $3)', [username, action, ip]);
-        res.json({ success: true });
+        const result = await rce.sendCommand(serverIdentifier, command);
+        res.json({ success: true, result });
     } catch (err) {
+        console.error(err);
         res.status(500).json({ error: err.message });
     }
 });
 
-app.get('/api/audit', async (req, res) => {
-    const limit = parseInt(req.query.limit) || 100;
-    try {
-        const result = await pool.query('SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT $1', [limit]);
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+// ---------- Health ----------
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', rceReady: !!rce });
 });
 
-// ---------- Start Server ----------
+// ---------- Start ----------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Bridge running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Bridge running on port ${PORT}`));
