@@ -1,4 +1,4 @@
-// server.js – DRAINED TABLET BRIDGE v7.0.0 (Discord OAuth fix with detailed logging)
+// server.js – DRAINED TABLET BRIDGE v7.0.0 (Full – working Discord OAuth, permissions, user management)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -20,38 +20,124 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
+// ---------- Database initialization (fixed – no ... placeholders) ----------
 async function initDB() {
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            discord_id TEXT UNIQUE,
-            username TEXT UNIQUE,
-            password_hash TEXT,
-            platform TEXT,
-            platform_id TEXT,
-            avatar_url TEXT,
-            role TEXT DEFAULT 'user',
-            disabled BOOLEAN DEFAULT FALSE,
-            session_token TEXT,
-            permissions JSONB DEFAULT '{}',
-            created_at TIMESTAMP DEFAULT NOW(),
-            last_login TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS combat_logs ( ... );
-        CREATE TABLE IF NOT EXISTS claims ( ... );
-        CREATE TABLE IF NOT EXISTS audit_log ( ... );
-        CREATE TABLE IF NOT EXISTS zones ( ... );
-        CREATE TABLE IF NOT EXISTS drained_blueprints ( ... );
-        CREATE TABLE IF NOT EXISTS drained_purchases ( ... );
-        CREATE TABLE IF NOT EXISTS shop_items ( ... );
-    `);
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`);
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS session_token TEXT`);
-    console.log('✅ Database ready');
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                discord_id TEXT UNIQUE,
+                username TEXT UNIQUE,
+                password_hash TEXT,
+                platform TEXT,
+                platform_id TEXT,
+                avatar_url TEXT,
+                role TEXT DEFAULT 'user',
+                disabled BOOLEAN DEFAULT FALSE,
+                session_token TEXT,
+                permissions JSONB DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT NOW(),
+                last_login TIMESTAMP
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS combat_logs (
+                id SERIAL PRIMARY KEY,
+                player_id TEXT NOT NULL,
+                player_name TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                victim TEXT,
+                weapon TEXT,
+                distance INTEGER,
+                timestamp BIGINT NOT NULL
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS claims (
+                id SERIAL PRIMARY KEY,
+                player_id TEXT NOT NULL,
+                item_shortname TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                claimed_at TIMESTAMP DEFAULT NOW(),
+                expires_at TIMESTAMP
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id SERIAL PRIMARY KEY,
+                username TEXT,
+                action TEXT NOT NULL,
+                ip TEXT,
+                timestamp TIMESTAMP DEFAULT NOW()
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS zones (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                position JSONB NOT NULL,
+                radius INTEGER,
+                flags JSONB,
+                enabled BOOLEAN DEFAULT true
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS drained_blueprints (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                price INT NOT NULL,
+                blocks JSONB NOT NULL,
+                enabled BOOLEAN DEFAULT true,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS drained_purchases (
+                id SERIAL PRIMARY KEY,
+                player_id TEXT NOT NULL,
+                blueprint_id INT NOT NULL REFERENCES drained_blueprints(id) ON DELETE CASCADE,
+                purchased_at TIMESTAMP DEFAULT NOW(),
+                deployed_at TIMESTAMP,
+                UNIQUE(player_id, blueprint_id)
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS shop_items (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                shortname TEXT NOT NULL,
+                price INT NOT NULL,
+                stock INT DEFAULT -1,
+                category TEXT,
+                image TEXT,
+                command TEXT,
+                enabled BOOLEAN DEFAULT true,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `);
+
+        // Add missing columns (safe)
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`);
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS session_token TEXT`);
+
+        console.log('✅ Database ready');
+    } catch (err) {
+        console.error('❌ Database init error:', err);
+        throw err;
+    }
 }
 initDB();
 
-// ---------- GPortal API ----------
+// ---------- GPortal API via rce.js ----------
 let rce = null;
 let serverIdentifier = 'main-server';
 
@@ -84,7 +170,7 @@ function isMaster(req) {
     return auth === `Bearer ${MASTER_CODE}`;
 }
 
-// ---------- Discord OAuth (FIXED with verbose error logging) ----------
+// ---------- Discord OAuth (with detailed logging) ----------
 const DISCORD_CLIENT_ID = '1481899114986733630';
 const DISCORD_CLIENT_SECRET = '9WuZs3eY1x38V7iF_SBkGJ8gc-5uUJIT';
 const REDIRECT_URI = 'https://drained-bridge.onrender.com/api/discord/callback';
@@ -103,7 +189,6 @@ app.get('/api/discord/callback', async (req, res) => {
     console.log('📩 Discord callback received. Code:', code);
 
     try {
-        // Exchange code for access token
         const tokenParams = new URLSearchParams({
             client_id: DISCORD_CLIENT_ID,
             client_secret: DISCORD_CLIENT_SECRET,
@@ -120,7 +205,6 @@ app.get('/api/discord/callback', async (req, res) => {
             body: tokenParams
         });
 
-        // Read response as text first to diagnose HTML errors
         const tokenResponseText = await tokenRes.text();
         console.log(`📄 Discord token response status: ${tokenRes.status}`);
         console.log(`📄 Discord token response body: ${tokenResponseText.substring(0, 500)}`);
@@ -157,7 +241,6 @@ app.get('/api/discord/callback', async (req, res) => {
 
         console.log(`👤 Discord user ID: ${discordId}, username: ${discordUser.username}`);
 
-        // Upsert user
         const existing = await pool.query('SELECT id, username FROM users WHERE discord_id = $1', [discordId]);
         if (existing.rows.length === 0) {
             await pool.query(
@@ -167,18 +250,16 @@ app.get('/api/discord/callback', async (req, res) => {
             console.log('✅ New user placeholder created.');
         }
 
-        // Redirect to frontend with Discord ID
         const frontendUrl = `https://the-drained-tablet.vercel.app/?discord_id=${discordId}&avatar=${encodeURIComponent(avatar || '')}`;
         console.log(`🚀 Redirecting to: ${frontendUrl}`);
         res.redirect(frontendUrl);
     } catch (err) {
         console.error('❌ Discord callback error:', err);
-        // Send a plain text error so we see it in the browser
         res.status(500).send(`Discord authentication failed: ${err.message}`);
     }
 });
 
-// ---------- REST endpoints (unchanged from previous correct version) ----------
+// ---------- User Registration ----------
 app.post('/api/register', async (req, res) => {
     const { discordId, username, platform, platformId, password, avatarUrl } = req.body;
     if (!discordId || !username || !platform || !platformId || !password) {
@@ -209,6 +290,7 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
+// ---------- Login ----------
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
@@ -246,6 +328,7 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
+// ---------- Get User Profile ----------
 app.get('/api/user/profile', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'No token' });
@@ -259,6 +342,7 @@ app.get('/api/user/profile', async (req, res) => {
     }
 });
 
+// ---------- Update Avatar ----------
 app.post('/api/user/avatar', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'No token' });
@@ -273,6 +357,7 @@ app.post('/api/user/avatar', async (req, res) => {
     }
 });
 
+// ---------- Verify Session ----------
 app.post('/api/verify', async (req, res) => {
     const { sessionToken } = req.body;
     if (!sessionToken) return res.status(401).json({ error: 'No session' });
@@ -285,6 +370,7 @@ app.post('/api/verify', async (req, res) => {
     }
 });
 
+// ---------- Admin User Management ----------
 app.get('/api/admin/users', async (req, res) => {
     if (!isMaster(req)) return res.status(403).json({ error: 'Master required' });
     const result = await pool.query('SELECT id, username, platform, platform_id, role, disabled, permissions, created_at, last_login FROM users ORDER BY created_at DESC');
@@ -333,6 +419,7 @@ app.delete('/api/admin/users/:id', async (req, res) => {
     res.json({ success: true });
 });
 
+// ---------- GPortal Command Endpoint ----------
 app.post('/api/gportal/command', async (req, res) => {
     const { command } = req.body;
     if (!command) return res.status(400).json({ error: 'Command required' });
@@ -346,9 +433,11 @@ app.post('/api/gportal/command', async (req, res) => {
     }
 });
 
+// ---------- Health Check ----------
 app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', rceReady: !!rce });
 });
 
+// ---------- Start Server ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Bridge running on port ${PORT}`));
